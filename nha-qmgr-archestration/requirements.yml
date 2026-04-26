@@ -1,0 +1,15 @@
+---
+# ============================================================
+# Collection Requirements — MQ Queue Manager Onboarding
+# ============================================================
+# This file is part of the promoted payload.
+# Install via: ansible-galaxy collection install -r requirements.yml
+#
+# Required for:
+#   - human_to_bytes filter (storage sizing computation)
+# ============================================================
+
+collections:
+  - name: community.general
+    version: ">=8.0.0"
+    source: https://galaxy.ansible.com

@@ -1,0 +1,126 @@
+---
+# =============================================================
+#  validate.yaml — Pre-Flight Variable Validation
+# =============================================================
+#
+#  PURPOSE:
+#    Validates ALL required variables before any API/crypto work.
+#    Designed to fail fast with clear, actionable error messages
+#    so operators can fix survey inputs immediately.
+#
+#  GROUPS:
+#    1. AAP Survey Inputs
+#    2. Derived Identity
+#    3. Certificate Configuration
+#    4. Venafi Connection
+#    5. Vault Connection
+#
+# =============================================================
+
+# ── 1. AAP Survey Inputs ─────────────────────────────────────
+- name: "Validate — AAP survey inputs"
+  ansible.builtin.assert:
+    that:
+      - app_prefix is defined and app_prefix | length > 0
+      - mq_environment is defined and mq_environment | upper in ['DEV', 'QA1', 'QA2', 'STG', 'PROD', 'PR']
+      - sequence_number is defined and sequence_number | length > 0
+      - instance_type is defined and instance_type in ['single', 'nha', 'nhacrr']
+      - mq_environment | upper in env_qmgr_abbr
+      - mq_environment | upper in env_namespace_abbr
+    fail_msg: >-
+      AAP survey inputs are invalid or incomplete.
+      Required: app_prefix (non-empty), mq_environment (DEV|QA1|QA2|STG|PROD|PR),
+      sequence_number (non-empty), instance_type (single|nha|nhacrr).
+      Got: app_prefix={{ app_prefix | default('UNDEFINED') }},
+      mq_environment={{ mq_environment | default('UNDEFINED') }},
+      sequence_number={{ sequence_number | default('UNDEFINED') }},
+      instance_type={{ instance_type | default('UNDEFINED') }}
+    quiet: true
+
+# ── 2. Derived Identity ──────────────────────────────────────
+- name: "Validate — Derived identity"
+  ansible.builtin.assert:
+    that:
+      - qmgr_name is defined and qmgr_name | length > 0
+      - qmgr_name_upper is defined and qmgr_name_upper | length > 0
+      - namespace is defined and namespace | length > 0
+      - instance_type in instance_cert_map
+      - instance_cert_map[instance_type] | length > 0
+    fail_msg: >-
+      Derived identity failed. qmgr_name={{ qmgr_name | default('UNDEFINED') }},
+      qmgr_name_upper={{ qmgr_name_upper | default('UNDEFINED') }},
+      namespace={{ namespace | default('UNDEFINED') }}.
+      Check app_prefix + mq_environment + sequence_number and instance_cert_map.
+    quiet: true
+
+# ── 3. Certificate & SAN Configuration ───────────────────────
+- name: "Validate — Certificate and SAN configuration"
+  ansible.builtin.assert:
+    that:
+      - cert_common_name is defined and cert_common_name | length > 0
+      - cert_country_name is defined and cert_country_name | length > 0
+      - cert_organization_name is defined and cert_organization_name | length > 0
+      - cert_key_size is defined and cert_key_size | int > 0
+      - cert_key_type is defined and cert_key_type in ['RSA', 'ECC']
+      - cluster_domains is defined and cluster_domains | length > 0
+      - mq_service_suffix is defined and mq_service_suffix | length > 0
+      - nha_replica_prefix is defined and nha_replica_prefix | length > 0
+      - app_route_suffixes is defined and app_route_suffixes | length > 0
+      - crr_route_suffixes is defined and crr_route_suffixes | length > 0
+      - qmgr_ha_replicas is defined and qmgr_ha_replicas | int > 0
+      - cert_renewal_threshold_days is defined and cert_renewal_threshold_days | int > 0
+    fail_msg: >-
+      Certificate/SAN configuration is incomplete in certs_control_vars.yaml.
+      Verify cluster_domains, mq_service_suffix, nha_replica_prefix,
+      app_route_suffixes, crr_route_suffixes, and cert_renewal_threshold_days.
+    quiet: true
+
+# ── 4. Venafi Connection ─────────────────────────────────────
+- name: "Validate — Venafi connection"
+  ansible.builtin.assert:
+    that:
+      - venafi_url is defined and venafi_url | length > 0
+      - venafi_username is defined and venafi_username | length > 0
+      - venafi_password is defined and venafi_password | length > 0
+      - venafi_client_id is defined and venafi_client_id | length > 0
+      - venafi_scope is defined and venafi_scope | length > 0
+      - venafi_policy_dn is defined and venafi_policy_dn | length > 0
+      - venafi_oauth is defined and venafi_oauth | length > 0
+      - venafi_token_revoke is defined and venafi_token_revoke | length > 0
+      - venafi_sdk_url is defined and venafi_sdk_url | length > 0
+      - env_to_venafi_env_type is defined
+      - mq_environment | lower in env_to_venafi_env_type
+      - venafi_custom_fields is defined and venafi_custom_fields | length > 0
+    fail_msg: >-
+      Venafi connection configuration is incomplete.
+      Verify venafi_url, venafi_username, venafi_password (env vars),
+      venafi_policy_dn, venafi_sdk_url, and the required API endpoint paths.
+      Also check env_to_venafi_env_type has key '{{ mq_environment | lower | default("?") }}'.
+    quiet: true
+
+# ── 5. Vault Connection ──────────────────────────────────────
+- name: "Validate — Vault connection"
+  ansible.builtin.assert:
+    that:
+      - vault_url is defined and vault_url | length > 0
+      - vault_cert_token is defined and vault_cert_token | length > 0
+      - vault_cert_mount_point is defined and vault_cert_mount_point | length > 0
+      - vault_cert_base_path is defined and vault_cert_base_path | length > 0
+    fail_msg: >-
+      Vault connection is incomplete. Verify vault_url, vault_cert_token
+      (set VAULT_TOKEN env var), vault_cert_mount_point, and vault_cert_base_path.
+    quiet: true
+  when: not (skip_vault_operations | default(false) | bool)
+
+# ── Summary ───────────────────────────────────────────────────
+- name: "Validate — ✅ All pre-flight checks passed"
+  ansible.builtin.debug:
+    msg:
+      - "Queue Manager  : {{ qmgr_name }}"
+      - "Namespace      : {{ namespace }}"
+      - "Instance Type  : {{ instance_type }}"
+      - "Cert Types     : {{ instance_cert_map[instance_type] | join(', ') }}"
+      - "Venafi URL     : {{ venafi_url }}"
+      - "Vault URL      : {{ vault_url }}"
+      - "Vault Path     : {{ vault_cert_base_path }}/"
+      - "Renewal Window : {{ cert_renewal_threshold_days }} days"

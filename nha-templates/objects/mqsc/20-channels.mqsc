@@ -1,0 +1,16 @@
+* ============================================================
+* MQ Channel Definitions — Placeholder Reference Content
+* ============================================================
+* Replace the example channel names, MCAUSER values, ciphers,
+* and channel counts below to match your own standards.
+* ============================================================
+
+* Non-TLS client channel for development-only use
+DEFINE CHANNEL('APP.CLIENT.NON_TLS.CL01') CHLTYPE(SVRCONN) MCAUSER('app_non_tls') TRPTYPE(TCP) MAXMSGL(4194304) REPLACE
+
+* Mutual TLS client channels
+DEFINE CHANNEL('APP.CLIENT.MTLS.CL01') CHLTYPE(SVRCONN) TRPTYPE(TCP) SSLCIPH('ANY_TLS12_OR_HIGHER') SSLCAUTH(REQUIRED) MCAUSER('app_mtls') MAXMSGL(4194304) REPLACE
+DEFINE CHANNEL('APP.ADMIN.MTLS.CL01') CHLTYPE(SVRCONN) TRPTYPE(TCP) SSLCIPH('ANY_TLS12_OR_HIGHER') SSLCAUTH(REQUIRED) MCAUSER('ops_mtls') MAXMSGL(4194304) REPLACE
+
+* Read-only monitoring channel
+DEFINE CHANNEL('APP.MONITOR.SVRCONN') CHLTYPE(SVRCONN) TRPTYPE(TCP) MCAUSER('monitor_ro') MAXMSGL(4194304) REPLACE

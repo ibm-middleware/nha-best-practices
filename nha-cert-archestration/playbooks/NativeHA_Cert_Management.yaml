@@ -1,0 +1,83 @@
+---
+# =============================================================
+#  NativeHA_Cert_Management.yaml — Unified Certificate Lifecycle
+# =============================================================
+#
+#  PURPOSE:
+#    Single entrypoint for ALL certificate operations:
+#    onboard, offboard, renew, and monitor.
+#
+#  AAP SURVEY VARIABLES:
+#    cert_action     — onboard | offboard | monitor | renew
+#    app_prefix      — e.g. "QMM"
+#    mq_environment  — DEV | QA1 | QA2 | STG | PROD | PR
+#    sequence_number — e.g. "001"
+#    instance_type   — single | nha | nhacrr
+#    monitor_scope   — single | all  (monitor only)
+#    confirm         — yes | no      (offboard only)
+#
+#  ACTIONS:
+#    onboard  — Provision certs (smart: skip/renew/new) + registry
+#    offboard — Revoke + purge certs + registry (requires confirm)
+#    renew    — Force-renew all certs (bypasses skip) + registry
+#    monitor  — Live health check + registry refresh + report
+#
+#  ARCHITECTURE:
+#    This playbook loads certs_control_vars.yaml plus the shared
+#    deployment naming maps, then routes to the appropriate role.
+#    The cert registry (cert_inventory.yaml) is updated by every
+#    action and serves as the single source of truth.
+#
+# =============================================================
+
+- name: "NativeHA Certificate Management — {{ cert_action | default('UNDEFINED') | upper }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../nativeha_templates/global_vars/certs_control_vars.yaml
+    - ../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  pre_tasks:
+    # ── Validate cert_action ─────────────────────────────────
+    - name: "Pre-flight — Validate cert_action"
+      ansible.builtin.assert:
+        that:
+          - cert_action is defined
+          - cert_action in ['onboard', 'offboard', 'monitor', 'renew']
+        fail_msg: >-
+          cert_action must be one of: onboard, offboard, monitor, renew.
+          Got: {{ cert_action | default('UNDEFINED') }}
+
+    # ── Set force-renew flag for renew action ────────────────
+    - name: "Pre-flight — Set force-renew flag"
+      ansible.builtin.set_fact:
+        cert_force_renew: "{{ cert_action == 'renew' }}"
+
+    # ── Display action banner ────────────────────────────────
+    - name: "Pre-flight — Action banner"
+      ansible.builtin.debug:
+        msg:
+          - "═══════════════════════════════════════════════"
+          - "  NativeHA Certificate Management"
+          - "  Action      : {{ cert_action | upper }}"
+          - "  Prefix      : {{ app_prefix | default('N/A') }}"
+          - "  Environment : {{ mq_environment | default('N/A') | upper }}"
+          - "  Sequence    : {{ sequence_number | default('N/A') }}"
+          - "  Instance    : {{ instance_type | default('N/A') }}"
+          - "{% if cert_action == 'monitor' %}  Monitor Scope: {{ monitor_scope | default('single') }}{% endif %}"
+          - "═══════════════════════════════════════════════"
+
+  roles:
+    # ── Onboard or Renew → cert_onboard role ─────────────────
+    - role: ../roles/cert_onboard
+      when: cert_action in ['onboard', 'renew']
+
+    # ── Offboard → cert_offboard role ────────────────────────
+    - role: ../roles/cert_offboard
+      when: cert_action == 'offboard'
+
+    # ── Monitor → cert_monitor role ──────────────────────────
+    - role: ../roles/cert_monitor
+      when: cert_action == 'monitor'

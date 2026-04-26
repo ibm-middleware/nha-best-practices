@@ -1,0 +1,170 @@
+---
+# =============================================================
+#  check_all_qmgrs.yaml — Health Check for All Queue Managers
+# =============================================================
+#
+#  PURPOSE:
+#    Reads the certificate registry for ALL managed queue managers
+#    and performs live health verification for each cert type.
+#    Optionally filters by environment if mq_environment is set.
+#
+#  INPUTS:
+#    monitor_scope: "all"
+#    mq_environment: (optional) — filter to only this environment
+#
+#  OUTPUT:
+#    Formatted health report covering all registered queue managers
+#    Updated registry with refreshed days_remaining and status
+#
+# =============================================================
+
+# ── 1. Read the full registry ────────────────────────────────
+- name: "Monitor All — Read certificate registry"
+  ansible.builtin.include_tasks: ../cert_common/tasks/read_registry.yaml
+
+- name: "Monitor All — Registry loaded"
+  ansible.builtin.debug:
+    msg: "Registry contains {{ cert_registry | length }} queue manager(s)"
+
+- name: "Monitor All — Fail if registry is empty"
+  ansible.builtin.fail:
+    msg: >-
+      Certificate registry is empty. No queue managers have been
+      onboarded yet. Run cert_action=onboard first.
+  when: cert_registry | length == 0
+
+# ── 2. Apply environment filter (if set) ─────────────────────
+- name: "Monitor All — Build queue manager list"
+  ansible.builtin.set_fact:
+    _monitor_qmgrs: >-
+      {% if mq_environment is defined and mq_environment | length > 0 -%}
+        {{ cert_registry | dict2items
+           | selectattr('value.environment', 'equalto', mq_environment | upper)
+           | items2dict }}
+      {%- else -%}
+        {{ cert_registry }}
+      {%- endif %}
+
+- name: "Monitor All — Target list"
+  ansible.builtin.debug:
+    msg: >-
+      Checking {{ _monitor_qmgrs | length }} queue manager(s)
+      {% if mq_environment is defined and mq_environment | length > 0 %}(filtered: {{ mq_environment | upper }}){% endif %}:
+      {{ _monitor_qmgrs.keys() | list | join(', ') }}
+
+- name: "Monitor All — Fail if filter returned empty"
+  ansible.builtin.fail:
+    msg: >-
+      No queue managers found
+      {% if mq_environment is defined %}for environment {{ mq_environment | upper }}{% endif %}.
+  when: _monitor_qmgrs | length == 0
+
+# ── 3. Create temp dir ──────────────────────────────────────
+- name: "Monitor All — Create temp dir"
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: _mq_monitor_all
+  register: _monitor_tmp
+
+# ── 4. Authenticate to Venafi ────────────────────────────────
+- name: "Monitor All — Authenticate to Venafi"
+  ansible.builtin.uri:
+    url: "{{ venafi_url }}{{ venafi_oauth }}"
+    method: POST
+    body_format: json
+    body:
+      username: "{{ venafi_username }}"
+      password: "{{ venafi_password }}"
+      client_id: "{{ venafi_client_id }}"
+      scope: "{{ venafi_scope }}"
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    validate_certs: "{{ venafi_validate_certs }}"
+    status_code: [200, 201]
+  register: _monitor_auth
+  no_log: true
+
+- name: "Monitor All — Store bearer token"
+  ansible.builtin.set_fact:
+    venafi_token: "{{ _monitor_auth.json.access_token }}"
+  no_log: true
+
+# ── 5. Initialize global report ─────────────────────────────
+- name: "Monitor All — Initialize trackers"
+  ansible.builtin.set_fact:
+    _health_report: []
+    _all_registries_to_update: []
+
+# ── 6. Iterate over each queue manager ───────────────────────
+- name: "Monitor All — Check each queue manager"
+  ansible.builtin.include_tasks: _check_one_qmgr_iter.yaml
+  loop: "{{ _monitor_qmgrs | dict2items }}"
+  loop_control:
+    loop_var: _qmgr_item
+    label: "{{ _qmgr_item.key | upper }}"
+
+# ── 7. Update registry with all refreshed data ──────────────
+- name: "Monitor All — Update registry for each queue manager"
+  ansible.builtin.include_tasks: ../cert_common/tasks/update_registry.yaml
+  loop: "{{ _all_registries_to_update }}"
+  loop_control:
+    loop_var: _reg_item
+    label: "{{ _reg_item.qmgr_name | upper }}"
+  vars:
+    registry_update: "{{ _reg_item }}"
+    registry_commit_msg: >-
+      cert monitor-all: {{ _reg_item.qmgr_name | upper }}
+      refreshed={{ _reg_item.data.certs | default({}) | length }} cert(s)
+  when: _all_registries_to_update | length > 0
+
+# ── 8. Cleanup ──────────────────────────────────────────────
+- name: "Monitor All — Cleanup temp dir"
+  ansible.builtin.file:
+    path: "{{ _monitor_tmp.path }}"
+    state: absent
+  when: _monitor_tmp is defined and _monitor_tmp.path is defined
+
+- name: "Monitor All — Revoke Venafi token"
+  ansible.builtin.uri:
+    url: "{{ venafi_url }}{{ venafi_token_revoke }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ venafi_token }}"
+    validate_certs: "{{ venafi_validate_certs }}"
+    status_code: [200, 401]
+  when: venafi_token is defined
+  failed_when: false
+  no_log: true
+
+# ── 9. Build final summary ──────────────────────────────────
+- name: "Monitor All — Count totals"
+  ansible.builtin.set_fact:
+    _healthy_count: "{{ _health_report | selectattr('status', 'eq', 'healthy') | list | length }}"
+    _issue_count: "{{ _health_report | rejectattr('status', 'eq', 'healthy') | list | length }}"
+    _issues_list: "{{ _health_report | rejectattr('status', 'eq', 'healthy') | list }}"
+    _qmgr_count: "{{ _monitor_qmgrs | length }}"
+
+# ── 10. Print formatted report ──────────────────────────────
+- name: "Monitor All — CERTIFICATE HEALTH REPORT"  # noqa jinja[invalid]
+  ansible.builtin.debug:
+    msg: "{{ _report_lines }}"
+  vars:
+    _report_lines: |
+      ═══════════════════════════════════════════════════════════
+        CERTIFICATE HEALTH REPORT — ALL QUEUE MANAGERS
+        Generated: {{ now(utc=true) | string }}
+        Scope: {{ _qmgr_count }} queue manager(s)
+      ═══════════════════════════════════════════════════════════
+      {% for entry in _health_report %}
+        {{ entry.qmgr }} | {{ entry.cert_type | upper }} | {{ entry.status_icon }} | Days: {{ entry.days_remaining }}
+      {% endfor %}
+      ───────────────────────────────────────────────────────────
+        Total: {{ _health_report | length }}  Healthy: {{ _healthy_count }}  Issues: {{ _issue_count }}
+      {% if _issue_count | int > 0 %}
+        Action Needed:
+      {% for issue in _issues_list %}
+          - {{ issue.qmgr }}/{{ issue.cert_type }} ({{ issue.status_icon }})
+      {% endfor %}
+      {% endif %}
+      ═══════════════════════════════════════════════════════════

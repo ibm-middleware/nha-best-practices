@@ -1,0 +1,18 @@
+---
+# vaultconnection.yaml — VSO VaultConnection CR
+# Defines the connection to HashiCorp Vault for the Vault Secrets Operator.
+# One per QM namespace (namespace-scoped).
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultConnection
+metadata:
+  name: {{ vso_vault_connection_name }}
+  namespace: {{ namespace }}
+  labels:
+    app.kubernetes.io/name: {{ qmgr_name }}
+    app.kubernetes.io/managed-by: ansible-automation
+spec:
+  address: {{ vault_url }}
+  skipTLSVerify: {{ vso_vault_skip_tls | lower }}
+{% if vso_vault_ca_secret %}
+  caCertSecretRef: {{ vso_vault_ca_secret }}
+{% endif %}

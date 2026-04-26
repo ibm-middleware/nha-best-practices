@@ -1,0 +1,34 @@
+---
+# ============================================================
+# Auto-discover next sequence number from Git repo
+# Scans target branch for existing <PREFIXID><ENV><SEQ> directories
+# and returns the next available 3-digit sequence.
+# ============================================================
+
+- name: "Discover — Ensure QUEUE_MANAGERS directory exists"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/queue_managers"
+    state: directory
+    mode: "0755"
+
+- name: "Discover — List existing QM directories"
+  ansible.builtin.shell: |
+    find "{{ git_work_dir }}/queue_managers" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+      | tr '[:upper:]' '[:lower:]' \
+      | sed -n "s/^{{ app_prefix | lower }}{{ env_code | lower }}\([0-9][0-9][0-9]\)$/\1/p" \
+      | sort -n
+  register: _existing_seq_scan
+  changed_when: false
+
+- name: "Discover — Parse sequence numbers"
+  ansible.builtin.set_fact:
+    _existing_seqs: "{{ _existing_seq_scan.stdout_lines | default([]) | map('int') | list }}"
+
+- name: "Discover — Compute next sequence"
+  ansible.builtin.set_fact:
+    seq_number: >-
+      {{ '%03d' | format(((_existing_seqs | max | default(0)) | int) + 1) }}
+
+- name: "Discover — Result"
+  ansible.builtin.debug:
+    msg: "Auto-discovered sequence: {{ seq_number }} (found {{ _existing_seqs | length }} existing)"

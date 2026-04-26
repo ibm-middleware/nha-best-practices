@@ -1,0 +1,19 @@
+---
+- name: "Step 5 — Delete from Vault"
+  community.hashi_vault.vault_kv2_delete:
+    url: "{{ vault_url }}"
+    auth_method: token
+    token: "{{ vault_cert_token }}"
+    engine_mount_point: "{{ vault_cert_mount_point }}"
+    namespace: "{{ vault_namespace if (vault_namespace | default('') | length > 0) else omit }}"
+    path: "{{ vault_cert_base_path }}/{{ cert_type_vault_subpath[item] }}"
+  loop: "{{ active_cert_types }}"
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
+
+- name: Step 5 — Vault purge complete
+  ansible.builtin.debug:
+    msg: "Deleted {{ active_cert_types | length }} path(s) under {{ vault_cert_base_path }}/"
+
+# Made with Bob

@@ -1,0 +1,154 @@
+---
+# crr-qmgr.yaml — NativeHA Cross-Region Replication (CRR) QueueManager CR
+# Populated and deployed by Ansible automation (nativeha_templates)
+# instance_type: nhacrr
+# Note: crr_role (Live/Recovery) and current_region are set per-region by Ansible
+apiVersion: mq.ibm.com/v1beta1
+kind: QueueManager
+metadata:
+  name: {{ qmgr_name }}
+  namespace: {{ namespace }}
+  labels:
+    mq-qmgr: {{ qmgr_name }}
+    app.kubernetes.io/name: {{ qmgr_name }}
+    app.kubernetes.io/instance: {{ qmgr_name }}-{{ current_region }}
+    app.kubernetes.io/managed-by: ansible-automation
+    mq.ibm.com/environment: {{ mq_environment | upper }}
+    mq.ibm.com/instance-type: nhacrr
+    mq.ibm.com/region: {{ current_region }}
+spec:
+  version: {{ mq_version }}
+  license:
+    accept: true
+    license: {{ license_id }}
+    use: {{ license_use }}
+  imagePullSecrets:
+    - name: ibm-entitlement-key
+
+  web:
+    enabled: {{ web_enabled }}
+    console:
+      authentication:
+        provider: {{ web_authentication }}
+      authorization:
+        provider: {{ web_authorization }}
+    manualConfig:
+      configMap:
+        name: {{ qmgr_name }}-{{ web_configmap }}
+
+  pki:
+    keys:
+      - name: default
+        secret:
+          secretName: "{{ qmgr_name }}-app-pki"
+          items:
+            - tls.key
+            - tls.crt
+    trust:
+      - name: clientca
+        secret:
+          secretName: "{{ qmgr_name }}-app-pki"
+          items:
+            - ca.crt
+
+  template:
+    pod:
+      volumes:
+        - name: scripts
+          configMap:
+            name: "{{ qmgr_name }}-utility-scripts"
+            defaultMode: 0755
+        - name: mqsc-config
+          projected:
+            defaultMode: 0755
+            sources:
+              - configMap:
+                  name: {{ qmgr_name }}-mqsc
+      containers:
+        - name: qmgr
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: mqsc-config
+              mountPath: /mq-config
+              readOnly: true
+          resources:
+            requests:
+              cpu: {{ qmgr_size.request_cpu }}
+              memory: {{ qmgr_size.request_memory }}
+            limits:
+              cpu: {{ qmgr_size.limits_cpu }}
+              memory: {{ qmgr_size.limits_memory }}
+      nodeSelector:
+        mqha: "true"
+      tolerations:
+        - key: mqha
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: topology.kubernetes.io/zone
+              labelSelector:
+                matchLabels:
+                  mq-qmgr: {{ qmgr_name }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: topology.kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    mq-qmgr: {{ qmgr_name }}
+
+  queueManager:
+    name: {{ qmgr_name_upper }}
+    mqsc:
+      - configMap:
+          name: {{ qmgr_name }}-mqsc
+          items:
+            - 10-network.mqsc
+            - 20-channels.mqsc
+            - 30-security.mqsc
+            - 40-objects.mqsc
+            - 50-other.mqsc
+    ini:
+      - configMap:
+          name: "{{ qmgr_name }}-ini"
+          items:
+            - qm.ini
+    availability:
+      type: NativeHA
+      tls:
+        secretName: "{{ qmgr_name }}-nha-tls"
+      nativeHAGroups:
+        local:
+          name: {{ current_region }}
+          role: {{ crr_role | trim }}
+          tls:
+            key:
+              secretName: "{{ qmgr_name }}-nhacrr-tls"
+            cipherSpec: {{ crr_cipher }}
+    metrics:
+      enabled: true
+      tls:
+        provider: openshift
+    readinessProbe:
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+      successThreshold: 1
+    recoveryLogs:
+      logFilePages: {{ qmgr_size.log_file_pages | default(32768) }}
+    storage:
+      queueManager:
+        type: persistent-claim
+        class: {{ storage_class_name }}
+        size: {{ qmgr_size.qmgr_storage }}
+      recoveryLogs:
+        type: persistent-claim
+        enabled: true
+        class: {{ storage_class_name }}
+        size: {{ qmgr_size.log_storage }}

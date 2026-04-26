@@ -1,0 +1,3 @@
+* 50-other.mqsc — Additional queue manager customizations
+* Place environment-specific or application-specific MQSC here.
+* This file is intentionally minimal; extend as needed per deployment.

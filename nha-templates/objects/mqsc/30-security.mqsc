@@ -1,0 +1,32 @@
+* ============================================================
+* MQ Security Baseline — Placeholder Reference Content
+* ============================================================
+* Replace the example channel names, principals, SSLPEER rules,
+* and authorities below to fit your own identity model.
+* ============================================================
+
+ALTER QMGR CHLAUTH(ENABLED)
+
+* Map mTLS channels to example service identities
+SET CHLAUTH('APP.CLIENT.MTLS.CL01') TYPE(SSLPEERMAP) SSLPEER('CN=*') USERSRC(MAP) MCAUSER('app_mtls') ACTION(REPLACE)
+SET CHLAUTH('APP.ADMIN.MTLS.CL01') TYPE(SSLPEERMAP) SSLPEER('CN=*') USERSRC(MAP) MCAUSER('ops_mtls') ACTION(REPLACE)
+
+* Optional hardening: block the non-TLS example channel everywhere
+* SET CHLAUTH('APP.CLIENT.NON_TLS.CL01') TYPE(ADDRESSMAP) ADDRESS('*') USERSRC(NOACCESS) ACTION(REPLACE)
+
+* Application principal permissions
+SET AUTHREC OBJTYPE(QMGR) PRINCIPAL('app_mtls') AUTHADD(CONNECT,INQ,DSP)
+SET AUTHREC PROFILE('APP.**') OBJTYPE(QUEUE) PRINCIPAL('app_mtls') AUTHADD(PUT,GET,INQ,BROWSE,DSP)
+SET AUTHREC OBJTYPE(QUEUE) PROFILE('SYSTEM.DEFAULT.MODEL.QUEUE') PRINCIPAL('app_mtls') AUTHADD(PUT,GET,INQ,DSP,BROWSE)
+
+* Operations principal permissions
+SET AUTHREC OBJTYPE(QMGR) PRINCIPAL('ops_mtls') AUTHADD(CONNECT,INQ,DSP)
+SET AUTHREC OBJTYPE(QUEUE) PROFILE('SYSTEM.ADMIN.COMMAND.QUEUE') PRINCIPAL('ops_mtls') AUTHADD(PUT,INQ)
+SET AUTHREC PROFILE('APP.**') OBJTYPE(CHANNEL) PRINCIPAL('ops_mtls') AUTHADD(DSP)
+
+* Monitoring principal permissions
+SET AUTHREC OBJTYPE(QMGR) PRINCIPAL('monitor_ro') AUTHADD(CONNECT,INQ,DSP)
+SET AUTHREC PROFILE('APP.**') OBJTYPE(QUEUE) PRINCIPAL('monitor_ro') AUTHADD(INQ,BROWSE,DSP)
+SET AUTHREC PROFILE('**') OBJTYPE(CHANNEL) PRINCIPAL('monitor_ro') AUTHADD(DSP)
+
+REFRESH SECURITY TYPE(AUTHSERV)

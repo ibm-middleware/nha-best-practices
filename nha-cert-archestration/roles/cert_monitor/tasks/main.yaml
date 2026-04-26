@@ -1,0 +1,44 @@
+---
+# =============================================================
+#  cert_monitor — Certificate Health Monitoring
+# =============================================================
+#
+#  PURPOSE:
+#    Monitors the health of managed TLS certificates by
+#    live-verifying against Vault and Venafi. Two modes:
+#
+#    1. SINGLE — Check one queue manager's certs
+#       Requires: app_prefix, mq_environment, sequence_number,
+#                 instance_type (from AAP survey)
+#
+#    2. ALL — Check every queue manager in the registry
+#       Optional: mq_environment (filters to one environment)
+#       Triggered by: monitor_scope=all
+#
+#  OUTPUTS:
+#    - Formatted health report in AAP job log
+#    - Updated registry with refreshed days_remaining + status
+#
+#  HEALTH STATUSES:
+#    ✅ HEALTHY       — Cert valid, > threshold days remaining
+#    ⚠️  EXPIRING      — Cert valid, ≤ threshold days remaining
+#    🔴 EXPIRED       — Cert past not_after date
+#    ❌ MISSING       — Cert not found in Vault
+#    ❌ CORRUPT       — Cert in Vault but PEM is unreadable
+#    🔶 DESYNC        — Cert valid in Vault but missing in Venafi
+#
+# =============================================================
+
+- name: "Monitor — Route to {{ monitor_scope | default('single') }} mode"  # noqa name[template]
+  ansible.builtin.debug:
+    msg: "Certificate Monitor — mode: {{ monitor_scope | default('single') }}"
+
+# ── Route: Single Queue Manager ─────────────────────────────
+- name: "Monitor — Single queue manager health check"
+  ansible.builtin.include_tasks: check_single_qmgr.yaml
+  when: monitor_scope | default('single') == 'single'
+
+# ── Route: All Queue Managers ────────────────────────────────
+- name: "Monitor — All queue managers health check"
+  ansible.builtin.include_tasks: check_all_qmgrs.yaml
+  when: monitor_scope | default('single') == 'all'

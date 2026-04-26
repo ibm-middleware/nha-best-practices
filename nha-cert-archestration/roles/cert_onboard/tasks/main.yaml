@@ -1,0 +1,229 @@
+---
+# =============================================================
+#  cert_onboard — MQ NativeHA Certificate Onboarding
+# =============================================================
+#
+#  PURPOSE:
+#    Provisions TLS certificates for an IBM MQ NativeHA queue
+#    manager. Integrates with Venafi for Certificate Authority
+#    services and HashiCorp Vault for secure storage.
+#
+#  PIPELINE:
+#    Step 1  →  Derive identity (qmgr_name, namespace)
+#    Step 2  →  Pre-flight validation (all inputs + connections)
+#    Step 3  →  Resolve cert types from instance_type
+#    Step 4  →  Authenticate to Venafi (OAuth bearer token)
+#    Step 5  →  Check existing certs in Vault & Venafi
+#              (decide: SKIP / RENEW / REQUEST_NEW per type)
+#    Step 6  →  Generate CSRs (only for actionable certs)
+#    Step 7  →  Submit CSRs to Venafi → Poll → Retrieve → Store in Vault
+#    Step 8  →  Update certificate registry (git commit + push)
+#    Step 9  →  Summary
+#
+#  SAFETY:
+#    - Private keys exist only in a temp dir; wiped in 'always' block
+#    - Venafi OAuth token is revoked in 'always' block
+#    - If ALL certs are valid, NO API mutations occur
+#
+#  INPUTS (AAP Survey / extra_vars):
+#    - app_prefix       : e.g. "QMM"
+#    - mq_environment   : DEV | QA1 | QA2 | STG | PROD | PR
+#    - sequence_number  : e.g. "001"
+#    - instance_type    : single | nha | nhacrr
+#
+# =============================================================
+
+# ─────────────────────────────────────────────────────────────
+# Step 1: Derive Queue Manager Identity
+# ─────────────────────────────────────────────────────────────
+# These two facts are computed IDENTICALLY in every cert and
+# qmgr role so that names always agree across the platform.
+- name: "Step 1 — Derive queue manager identity"
+  ansible.builtin.include_tasks: ../cert_common/tasks/derive_identity.yaml
+
+# ─────────────────────────────────────────────────────────────
+# Step 2: Pre-Flight Validation
+# ─────────────────────────────────────────────────────────────
+# Validates every required variable BEFORE any API or crypto
+# call.  Fails fast with an actionable error message.
+- name: "Step 2 — Run pre-flight variable validation"
+  ansible.builtin.include_tasks: validate.yaml
+
+# ─────────────────────────────────────────────────────────────
+# Step 3: Resolve Certificate Types
+# ─────────────────────────────────────────────────────────────
+#   single → [app]
+#   nha    → [app, nativeha]
+#   nhacrr → [app, nativeha, crr]
+- name: Step 3 — Resolve cert types
+  ansible.builtin.set_fact:
+    active_cert_types: "{{ instance_cert_map[instance_type] }}"
+
+- name: "Step 3 — Cert profile"
+  ansible.builtin.debug:
+    msg: "{{ active_cert_types | length }} cert(s): {{ active_cert_types | join(', ') }}"
+
+# ─────────────────────────────────────────────────────────────
+# Steps 4–8: Main Block (with guaranteed cleanup)
+# ─────────────────────────────────────────────────────────────
+- name: "Steps 4-8 — Certificate lifecycle"
+  block:
+
+    # ── Step 4: Create temp dir + Authenticate to Venafi ──────
+    - name: "Step 4a — Create temp dir for key material"
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: _mq_certs
+      register: cert_tmp_dir
+
+    - name: "Step 4b — Authenticate to Venafi (OAuth)"
+      ansible.builtin.uri:
+        url: "{{ venafi_url }}{{ venafi_oauth }}"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ venafi_username }}"
+          password: "{{ venafi_password }}"
+          client_id: "{{ venafi_client_id }}"
+          scope: "{{ venafi_scope }}"
+        headers:
+          accept: "application/json"
+          content-type: "application/json"
+        validate_certs: "{{ venafi_validate_certs }}"
+        status_code: [200, 201]
+      register: _venafi_auth
+      no_log: true
+
+    - name: "Step 4b — Store bearer token"
+      ansible.builtin.set_fact:
+        venafi_token: "{{ _venafi_auth.json.access_token }}"
+      no_log: true
+
+    # ── Step 5: Check Existing Certs ─────────────────────────
+    # For each cert type, reads Vault and queries Venafi to
+    # decide whether to SKIP, RENEW, or REQUEST_NEW.
+    # Results are stored in cert_actions dict.
+    - name: "Step 5 — Initialize cert_actions tracker"
+      ansible.builtin.set_fact:
+        cert_actions: {}
+        registry_cert_data: {}
+
+    - name: Step 5 — Check existing certs
+      ansible.builtin.include_tasks: check_existing_cert.yaml
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+
+    # ── Display the action plan ──────────────────────────────
+    - name: "Step 5 — Action Plan"
+      ansible.builtin.debug:
+        msg: "{{ cert_type_item | upper }}: {{ cert_actions[cert_type_item].action | upper }} — {{ cert_actions[cert_type_item].reason }}"
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        loop_var: cert_type_item
+        label: "{{ cert_type_item }}"
+
+    # ── Build actionable list ────────────────────────────────
+    - name: "Step 5 — Determine actionable cert types"
+      ansible.builtin.set_fact:
+        actionable_cert_types: >-
+          {{ cert_actions | dict2items
+             | selectattr('value.action', 'ne', 'skip')
+             | map(attribute='key') | list }}
+
+    - name: "Step 5 — Result"
+      ansible.builtin.debug:
+        msg: >-
+          {{ actionable_cert_types | length }} cert(s) need action:
+          {{ actionable_cert_types | join(', ') | default('none — all valid') }}
+
+    # ── Step 6: Generate CSRs ────────────────────────────────
+    - name: Step 6 — Generate CSR
+      ansible.builtin.include_tasks: generate_csr.yaml
+      loop: "{{ actionable_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+      when: actionable_cert_types | length > 0
+
+    # ── Step 7: Submit → Poll → Retrieve → Store in Vault ────
+    - name: Step 7 — Submit and store
+      ansible.builtin.include_tasks: submit_and_store.yaml
+      loop: "{{ actionable_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+      when: actionable_cert_types | length > 0
+
+    # ── Step 8: Update Certificate Registry ────────────────────
+    - name: "Step 8 — Update certificate registry"
+      ansible.builtin.include_tasks: ../cert_common/tasks/update_registry.yaml
+      vars:
+        registry_update:
+          qmgr_name: "{{ qmgr_name }}"
+          data:
+            app_prefix: "{{ app_prefix }}"
+            environment: "{{ mq_environment | upper }}"
+            sequence_number: "{{ sequence_number }}"
+            instance_type: "{{ instance_type }}"
+            namespace: "{{ namespace }}"
+            last_updated: "{{ now(utc=true) | string }}"
+            certs: "{{ registry_cert_data }}"
+        registry_commit_msg: >-
+          cert {{ cert_force_renew | default(false) | bool | ternary('renew', 'onboard') }}:
+          {{ qmgr_name | upper }} [{{ active_cert_types | join(', ') }}]
+          actioned={{ actionable_cert_types | length }}
+          skipped={{ active_cert_types | difference(actionable_cert_types) | length }}
+      when: registry_cert_data | default({}) | length > 0
+
+    # ── Step 9: Summary ──────────────────────────────────────
+    - name: "Step 9 — CERT ONBOARDING COMPLETE"
+      ansible.builtin.debug:
+        msg:
+          - "═══════════════════════════════════════════════"
+          - "Queue Manager : {{ qmgr_name | upper }}"
+          - "Environment   : {{ mq_environment | upper }}"
+          - "Instance Type : {{ instance_type }}"
+          - "Total Certs   : {{ active_cert_types | length }}"
+          - "Actioned      : {{ actionable_cert_types | length }} ({{ actionable_cert_types | join(', ') | default('none') }})"
+          - "Skipped       : {{ active_cert_types | difference(actionable_cert_types) | join(', ') | default('none') }}"
+          - "Vault Path    : {{ vault_cert_base_path }}/"
+          - "Registry      : Updated ✅"
+          - "═══════════════════════════════════════════════"
+
+  # ── Error Handler ────────────────────────────────────────────
+  rescue:
+    - name: "FAILED — Display error context"
+      ansible.builtin.debug:
+        msg: >-
+          Certificate onboarding FAILED for {{ qmgr_name | upper }}
+          (instance_type={{ instance_type }}).
+          Key material will be cleaned up automatically.
+
+    - name: "FAILED — Re-raise for AAP"
+      ansible.builtin.fail:
+        msg: "Certificate onboarding failed. See task output above."
+
+  # ── Guaranteed Cleanup ───────────────────────────────────────
+  # ALWAYS runs, even on failure:
+  #   1. Wipe temp dir (private keys + CSRs)
+  #   2. Revoke Venafi OAuth token
+  always:
+    - name: "Cleanup — Wipe temp directory"
+      ansible.builtin.file:
+        path: "{{ cert_tmp_dir.path }}"
+        state: absent
+      when: cert_tmp_dir is defined and cert_tmp_dir.path is defined
+
+    - name: "Cleanup — Revoke Venafi OAuth token"
+      ansible.builtin.uri:
+        url: "{{ venafi_url }}{{ venafi_token_revoke }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ venafi_token }}"
+        validate_certs: "{{ venafi_validate_certs }}"
+        status_code: [200, 401]
+      when: venafi_token is defined
+      failed_when: false
+      no_log: true

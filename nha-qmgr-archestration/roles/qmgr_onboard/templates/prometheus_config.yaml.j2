@@ -1,0 +1,54 @@
+---
+# ConfigMap for MQ Prometheus exporter configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ qmgr_name }}-prometheus-config
+  namespace: {{ namespace }}
+  labels:
+    app.kubernetes.io/name: {{ qmgr_name }}-prometheus-exporter
+    app.kubernetes.io/component: monitoring
+data:
+  mq_prometheus.yaml: |
+    global:
+      useObjectStatus: true
+      usePublications: true
+      logLevel: {{ prometheus_log_level }}
+      pollInterval: {{ prometheus_poll_interval }}
+      rediscoverInterval: {{ prometheus_rediscover_interval }}
+
+    connection:
+      queueManager: {{ qmgr_name_upper }}
+      connName: {{ qmgr_name }}-ibm-mq.{{ namespace }}.svc.cluster.local({{ prometheus_mq_port }})
+      channel: {{ prometheus_monitor_channel }}
+      clientConnection: true
+
+    objects:
+      queues:
+{% for q in prometheus_monitored_queues %}
+        - '{{ q }}'
+{% endfor %}
+      channels:
+{% for c in prometheus_monitored_channels %}
+        - '{{ c }}'
+{% endfor %}
+      topics:
+{% for t in prometheus_monitored_topics %}
+        - '{{ t }}'
+{% endfor %}
+      subscriptions:
+{% for s in prometheus_monitored_subscriptions %}
+        - '{{ s }}'
+{% endfor %}
+
+    filters:
+      hideSvrConnJobname: false
+      showInactiveChannels: {{ prometheus_show_inactive_channels | lower }}
+      queueSubscriptionSelector:
+{% for sel in prometheus_queue_subscription_selector %}
+        - {{ sel }}
+{% endfor %}
+
+    prometheus:
+      port: {{ prometheus_metrics_port }}
+      keepRunning: {{ prometheus_keep_running | lower }}

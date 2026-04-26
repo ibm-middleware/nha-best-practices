@@ -1,0 +1,150 @@
+---
+# =============================================================
+#  generate_csr.yaml — Private Key + CSR Generation
+# =============================================================
+#
+#  PURPOSE:
+#    Generates a private key and Certificate Signing Request
+#    for a single cert type. Uses community.crypto modules
+#    (no external API calls — fully offline).
+#
+#  CALLED WITH:
+#    cert_type  — loop var: app | nativeha | crr
+#
+#  SAN STRATEGY (verified from live MQ Operator cluster):
+#
+#    APP cert (secret: {qmgr}-app-pki):
+#      Used by: Client connections (1414) + Web console (9443)
+#      SANs:
+#        - ClusterIP service: {qmgr}-ibm-mq (short + FQDN variants)
+#        - Route hostnames:   {qmgr}-ibm-mq-qm-{ns}.{domain}    (clients)
+#                             {qmgr}-ibm-mq-web-{ns}.{domain}    (web UI)
+#
+#    NATIVEHA cert (secret: {qmgr}-nha-tls):
+#      Used by: NativeHA log replication between pods (port 9414)
+#      SANs:
+#        - Per-replica ClusterIP services:
+#          {qmgr}-ibm-mq-replica-0 (short + FQDN)
+#          {qmgr}-ibm-mq-replica-1
+#          {qmgr}-ibm-mq-replica-2
+#        Note: The operator does NOT use a headless service.
+#              It creates per-pod ClusterIP services instead.
+#
+#    CRR cert (secret: {qmgr}-nhacrr-tls):
+#      Used by: Cross-region replication (port 9415)
+#      SANs:
+#        - Route hostnames: {qmgr}-ibm-mq-nhacrr-{ns}.{domain}
+#          on ALL cluster domains (cert must be valid on both clusters)
+#
+# =============================================================
+
+# ── Build SAN List ───────────────────────────────────────────
+
+# Start with common name
+- name: Initialize SAN list for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans:
+      - "DNS:{{ cert_common_name }}"
+
+# ═══════════════════════════════════════════════════════════════
+# APP cert SANs
+# ═══════════════════════════════════════════════════════════════
+
+# ClusterIP service: {qmgr}-ibm-mq (short name + all K8s DNS variants)
+- name: Add ClusterIP service SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: >-
+      {{ _current_sans + [
+           'DNS:' ~ qmgr_name ~ '-' ~ mq_service_suffix,
+           'DNS:' ~ qmgr_name ~ '-' ~ mq_service_suffix ~ '.' ~ namespace,
+           'DNS:' ~ qmgr_name ~ '-' ~ mq_service_suffix ~ '.' ~ namespace ~ '.svc',
+           'DNS:' ~ qmgr_name ~ '-' ~ mq_service_suffix ~ '.' ~ namespace ~ '.svc.cluster.local'
+         ] }}
+  when: cert_type == 'app'
+
+# Route hostnames: {qmgr}-{route_suffix}-{namespace}.{cluster_domain}
+# Example: qmmdev001-ibm-mq-qm-qmm-mq-dev-001.apps.ocp-use-001.example.lab
+- name: Add route SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: >-
+      {{ _current_sans + [
+           'DNS:' ~ qmgr_name ~ '-' ~ item.0 ~ '-' ~ namespace ~ '.' ~ item.1
+         ] }}
+  loop: "{{ app_route_suffixes | product(cluster_domains) | list }}"
+  loop_control:
+    label: "{{ qmgr_name }}-{{ item.0 }}-{{ namespace }}.{{ item.1 }}"
+  when: cert_type == 'app'
+
+# ═══════════════════════════════════════════════════════════════
+# NATIVEHA cert SANs
+# ═══════════════════════════════════════════════════════════════
+
+# Per-replica ClusterIP services: {qmgr}-ibm-mq-replica-{N}
+# The MQ Operator creates one ClusterIP service per pod for
+# NativeHA log replication on port 9414.
+- name: Add NativeHA per-replica service SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: >-
+      {{ _current_sans + [
+           'DNS:' ~ qmgr_name ~ '-' ~ nha_replica_prefix ~ '-' ~ item | string,
+           'DNS:' ~ qmgr_name ~ '-' ~ nha_replica_prefix ~ '-' ~ item | string ~ '.' ~ namespace ~ '.svc.cluster.local'
+         ] }}
+  loop: "{{ range(0, qmgr_ha_replicas | int) | list }}"
+  when: cert_type == 'nativeha'
+
+# ═══════════════════════════════════════════════════════════════
+# CRR cert SANs
+# ═══════════════════════════════════════════════════════════════
+
+# Route hostnames: {qmgr}-ibm-mq-nhacrr-{namespace}.{cluster_domain}
+# Must include ALL cluster domains — the cert needs to be valid
+# on both the live and recovery cluster.
+- name: Add CRR route SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: >-
+      {{ _current_sans + [
+           'DNS:' ~ qmgr_name ~ '-' ~ item.0 ~ '-' ~ namespace ~ '.' ~ item.1
+         ] }}
+  loop: "{{ crr_route_suffixes | product(cluster_domains) | list }}"
+  loop_control:
+    label: "{{ qmgr_name }}-{{ item.0 }}-{{ namespace }}.{{ item.1 }}"
+  when: cert_type == 'crr'
+
+# ═══════════════════════════════════════════════════════════════
+# Extra SANs (optional, all cert types)
+# ═══════════════════════════════════════════════════════════════
+- name: Append extra SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: "{{ _current_sans + qmgr_extra_sans }}"
+  when: qmgr_extra_sans | length > 0
+
+- name: Display SAN list for {{ cert_type }}
+  ansible.builtin.debug:
+    msg: "{{ _current_sans | length }} SANs: {{ _current_sans }}"
+
+# ── Generate Private Key ─────────────────────────────────────
+- name: Generate private key for {{ cert_type }}
+  community.crypto.openssl_privatekey:
+    path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.key"
+    size: "{{ cert_key_size }}"
+    type: "{{ cert_key_type }}"
+    state: present
+  no_log: true
+
+# ── Generate CSR ─────────────────────────────────────────────
+- name: Generate CSR for {{ cert_type }}
+  community.crypto.openssl_csr:
+    path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.csr"
+    privatekey_path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.key"
+    common_name: "{{ cert_common_name }}"
+    country_name: "{{ cert_country_name }}"
+    state_or_province_name: "{{ cert_state_or_province }}"
+    locality_name: "{{ cert_locality_name }}"
+    organization_name: "{{ cert_organization_name }}"
+    organizational_unit_name: "{{ cert_organizational_unit }}"
+    subject_alt_name: "{{ _current_sans }}"
+    state: present
+
+- name: CSR generated for {{ cert_type }}
+  ansible.builtin.debug:
+    msg: "Key + CSR → {{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.csr"

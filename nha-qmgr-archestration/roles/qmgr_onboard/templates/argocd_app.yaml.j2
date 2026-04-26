@@ -1,0 +1,40 @@
+---
+# ArgoCD Application — deploys {{ qmgr_name }} to {{ current_region }} region
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ qmgr_name }}-{{ current_region }}
+  namespace: {{ argocd_namespace }}
+  labels:
+    app.kubernetes.io/name: {{ qmgr_name }}
+    app.kubernetes.io/instance: {{ qmgr_name }}-{{ current_region }}
+    app.kubernetes.io/component: queue-manager
+    app.kubernetes.io/managed-by: ansible-automation
+    mq.ibm.com/environment: {{ mq_environment | upper }}
+    mq.ibm.com/instance-type: {{ instance_type }}
+    mq.ibm.com/region: {{ current_region }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ argocd_project }}
+  source:
+    repoURL: {{ git_base_url }}
+    targetRevision: {{ target_branch }}
+    path: queue_managers/{{ qmgr_name }}/{{ instance_type }}/overlays/{{ current_region }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ namespace }}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+  ignoreDifferences:
+    - kind: Secret
+      jsonPointers:
+        - /data
+        - /metadata/annotations
+        - /metadata/labels

@@ -1,0 +1,25 @@
+---
+# Common objects kustomization
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: {{ qmgr_name }}-mqsc
+    files:
+{% for file in mqsc_files %}
+      - mqsc/{{ file }}
+{% endfor %}
+  - name: {{ qmgr_name }}-ini
+    files:
+      - ini/qm.ini
+  - name: {{ qmgr_name }}-webconsole-config
+    files:
+      - web/mqwebuser.xml
+{% if enable_scripts_configmap | default(true) | bool %}
+  - name: {{ qmgr_name }}-utility-scripts
+    files:
+{% for file in script_files %}
+      - utility_scripts/{{ file }}
+{% endfor %}
+{% endif %}

@@ -1,0 +1,8 @@
+---
+# Common monitoring kustomization
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - prometheus_config.yaml
+  - prometheus_deployment.yaml
+  - prometheus_service.yaml
