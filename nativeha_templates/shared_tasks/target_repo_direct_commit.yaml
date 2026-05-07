@@ -20,6 +20,9 @@
 #   namespace, instance_type, selected_size_tier, qmgr_size,
 #   _target_regions, _upgrade_version, _upgrade_image, _upgrade_license_id
 #   are included in CHANGELOG.md only when the caller has defined them.
+#   target_repo_pr_branch_subject, target_repo_pr_title_subject,
+#   target_repo_pr_qmgr_label, and target_repo_pr_changelog_path let bulk
+#   Day-2 actions use app/env-level publish metadata.
 #
 # Output fact:
 #   target_repo_pr_result - kept compatible with PR mode so callers can
@@ -40,10 +43,24 @@
       - target_repo_pr_validation is defined
     fail_msg: "Missing required target repo publish input facts."
 
-- name: "Direct publish - Resolve identity"
+- name: "Direct publish - Resolve branch identity"
   ansible.builtin.set_fact:
-    # Use qmgr_name_normalized when a Day-2 role provides it; otherwise use qmgr_name.
-    _direct_qmgr: "{{ (qmgr_name_normalized | default(qmgr_name)) | lower }}"
+    # Use an explicit branch subject for bulk Day-2 actions when supplied.
+    # Otherwise use qmgr_name_normalized when a Day-2 role provides it, or qmgr_name.
+    _direct_qmgr: "{{ (target_repo_pr_branch_subject | default(qmgr_name_normalized | default(qmgr_name), true)) | lower }}"
+
+- name: "Direct publish - Resolve display identity"
+  ansible.builtin.set_fact:
+    _direct_qmgr_label: >-
+      {{
+        target_repo_pr_qmgr_label
+        | default((_direct_qmgr | upper), true)
+      }}
+    _direct_title_subject: >-
+      {{
+        target_repo_pr_title_subject
+        | default(target_repo_pr_qmgr_label | default((_direct_qmgr | upper), true), true)
+      }}
     # Changelog is per queue manager unless caller overrides target_repo_pr_changelog_path.
     _direct_changelog_rel: >-
       {{
@@ -147,7 +164,7 @@
 
           - Action: {{ target_repo_pr_action_label }}
           - Environment: {{ env_upper }}
-          - Queue manager: {{ _direct_qmgr | upper }}
+          - Queue manager: {{ _direct_qmgr_label }}
           {% if _direct_namespace | string | length > 0 %}
           - Namespace: {{ _direct_namespace }}
           {% endif %}
@@ -204,7 +221,7 @@
 
     - name: "Direct publish - Prepare commit title"
       ansible.builtin.set_fact:
-        _direct_title: "[{{ env_upper }}] {{ target_repo_pr_action_label }} {{ _direct_qmgr | upper }}"
+        _direct_title: "[{{ env_upper }}] {{ target_repo_pr_action_label }} {{ _direct_title_subject }}"
 
     - name: "Direct publish - Stage all changes"
       ansible.builtin.command:

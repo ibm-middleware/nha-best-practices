@@ -98,12 +98,12 @@ regions:
     region_label: "east"
     cluster_domain: "apps.ocp-cluster1-001.example.lab"
     # Company example:
-    # cluster_domain: "apps.ocp-cluster1qa01.ocp-cluster1.qa.aws.example.lab"
+    # cluster_domain: "apps.ocp-cluster1qa01.ocp-cluster1.qa.example.lab"
   cluster2:
     region_label: "west"
     cluster_domain: "apps.ocp-cluster2-001.example.lab"
     # Company example:
-    # cluster_domain: "apps.ocp-uswqa01.ocp-cluster2.qa.aws.example.lab"
+    # cluster_domain: "apps.ocp-cluster2qa01.ocp-cluster2.qa.example.lab"
 
 # Default deploy region when lab has only one cluster
 default_deploy_region: "cluster1"
@@ -181,27 +181,27 @@ vso_refresh_after: "60s"             # How often VSO re-checks Vault for cert ch
 vault_url: "https://services.example.lab:8200"
 
 # --- Vault Security Zones ---
-# Logic: If app_sys_id is in 'hra.apps', use hra settings. Otherwise, default to sra.
+# Logic: If app_sys_id is in 'zone1.apps', use zone1 settings. Otherwise, default to zone2.
 # NOTE:
 # - 'label' is the Vault Enterprise namespace value sent as X-Vault-Namespace.
 #   Leave it blank when using the root namespace or Vault Community Edition.
 # - When 'label' is set, keep 'mount' relative to that Vault namespace
-#   (for example "kv" instead of "hra/kv" if the namespace itself is "hra").
+#   (for example "kv" instead of "zone1/kv" if the namespace itself is "zone1").
 # - 'auth_mount' is the Kubernetes auth mount path inside that Vault namespace.
 vault_security_zones:
-  hra:
-    mount: "hra/kv"
-    label: ""                        # Example for Enterprise: "hra"
+  zone1:
+    mount: "zone1/kv"
+    label: ""                        # Example for Enterprise: "zone1"
     auth_mount: "kubernetes"
-    vso_role: "{{ app_prefix }}-hra-vso-role"
-    vso_sa: "{{ app_prefix }}-hra-vso-sa"
-    apps: ["dmq", "amq", "mqp"]
-  sra:
-    mount: "sra/kv"
-    label: ""                        # Example for Enterprise: "sra"
+    vso_role: "{{ app_prefix }}-zone1-vso-role"
+    vso_sa: "{{ app_prefix }}-zone1-vso-sa"
+    apps: ["app1", "app2", "app3"]
+  zone2:
+    mount: "zone2/kv"
+    label: ""                        # Example for Enterprise: "zone2"
     auth_mount: "kubernetes"
-    vso_role: "{{ app_prefix }}-sra-vso-role"
-    vso_sa: "{{ app_prefix }}-sra-vso-sa"
+    vso_role: "{{ app_prefix }}-zone2-vso-role"
+    vso_sa: "{{ app_prefix }}-zone2-vso-sa"
 
 # Vault role will be derived dynamically in the playbook based on the zone:
 # vso_vault_role: "{{ vault_security_zones[_zone].vso_role }}"
@@ -219,7 +219,7 @@ sizing:
       qmgr_storage: "500Mi"
       log_storage: "500Mi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     medium:
       request_cpu: "500m"
       limits_cpu: "1"
@@ -228,7 +228,7 @@ sizing:
       qmgr_storage: "1Gi"
       log_storage: "1Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
   QA1:
     small:
       request_cpu: "250m"
@@ -238,7 +238,7 @@ sizing:
       qmgr_storage: "500Mi"
       log_storage: "500Mi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     medium:
       request_cpu: "500m"
       limits_cpu: "1"
@@ -247,7 +247,7 @@ sizing:
       qmgr_storage: "1Gi"
       log_storage: "1Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
   QA2:
     small:
       request_cpu: "300m"
@@ -257,7 +257,7 @@ sizing:
       qmgr_storage: "1Gi"
       log_storage: "1Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     medium:
       request_cpu: "500m"
       limits_cpu: "1"
@@ -266,7 +266,7 @@ sizing:
       qmgr_storage: "5Gi"
       log_storage: "5Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     large:
       request_cpu: "1"
       limits_cpu: "2"
@@ -275,7 +275,7 @@ sizing:
       qmgr_storage: "10Gi"
       log_storage: "20Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     xlarge:
       request_cpu: "2"
       limits_cpu: "4"
@@ -284,7 +284,7 @@ sizing:
       qmgr_storage: "20Gi"
       log_storage: "40Gi"
       log_file_pages: 65536
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
   QA3:
     small:
       request_cpu: "300m"
@@ -294,7 +294,7 @@ sizing:
       qmgr_storage: "1Gi"
       log_storage: "1Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     medium:
       request_cpu: "500m"
       limits_cpu: "1"
@@ -303,7 +303,7 @@ sizing:
       qmgr_storage: "5Gi"
       log_storage: "5Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     large:
       request_cpu: "1"
       limits_cpu: "2"
@@ -312,7 +312,7 @@ sizing:
       qmgr_storage: "10Gi"
       log_storage: "20Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     xlarge:
       request_cpu: "2"
       limits_cpu: "4"
@@ -321,7 +321,7 @@ sizing:
       qmgr_storage: "20Gi"
       log_storage: "40Gi"
       log_file_pages: 65536
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
   PROD:
     small:
       request_cpu: "500m"
@@ -331,7 +331,7 @@ sizing:
       qmgr_storage: "5Gi"
       log_storage: "5Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     medium:
       request_cpu: "1"
       limits_cpu: "2"
@@ -340,7 +340,7 @@ sizing:
       qmgr_storage: "10Gi"
       log_storage: "20Gi"
       log_file_pages: 32768
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     large:
       request_cpu: "2"
       limits_cpu: "4"
@@ -349,7 +349,7 @@ sizing:
       qmgr_storage: "20Gi"
       log_storage: "40Gi"
       log_file_pages: 65536
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
     xlarge:
       request_cpu: "4"
       limits_cpu: "8"
@@ -358,7 +358,7 @@ sizing:
       qmgr_storage: "50Gi"
       log_storage: "100Gi"
       log_file_pages: 65536
-      storage_class: "lvms-vg1"
+      storage_class: "standard"
 
 # --- Monitoring & WebUI ---
 # Toggles controlling what goes into base/monitoring/.
@@ -397,7 +397,7 @@ prometheus_resources:
 prometheus_monitored_queues:
   - "*"
   - "!SYSTEM.*"
-  - "!AMQ.*"
+  - "!APP2.*"
 prometheus_monitored_channels:
   - "*"
 prometheus_monitored_topics:

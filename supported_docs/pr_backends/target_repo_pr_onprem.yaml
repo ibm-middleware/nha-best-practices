@@ -36,8 +36,13 @@
 #   target_repo_pr_summary    - PR/changelog summary text
 #   target_repo_pr_validation - validation text written to changelog
 #
+# Optional input variables:
+#   target_repo_pr_branch_subject, target_repo_pr_title_subject,
+#   target_repo_pr_qmgr_label, and target_repo_pr_changelog_path let bulk
+#   Day-2 actions use app/env-level publish metadata.
+#
 # Derived facts created here:
-#   _pr_qmgr               - queue manager name used in branch matching
+#   _pr_qmgr               - queue manager or bulk subject used in branches
 #   _pr_app                - app prefix used in feature/<app>/<qmgr>-qmgr
 #   _pr_qmgr_branch_prefix - prefix used to find existing open PRs
 #   _pr_changelog_rel      - queue-manager CHANGELOG.md path
@@ -67,14 +72,28 @@
 # ── 2. Resolve Identity ─────────────────────────────────────
 - name: "PR — Resolve branch identity"
   ansible.builtin.set_fact:
-    # Prefer qmgr_name_normalized from Day-2 roles; onboarding uses qmgr_name.
-    _pr_qmgr: "{{ (qmgr_name_normalized | default(qmgr_name)) | lower }}"
+    # Prefer an explicit branch subject for bulk Day-2 actions when supplied.
+    # Otherwise use qmgr_name_normalized from Day-2 roles; onboarding uses qmgr_name.
+    _pr_qmgr: "{{ (target_repo_pr_branch_subject | default(qmgr_name_normalized | default(qmgr_name), true)) | lower }}"
     # app_prefix exists in onboarding; Day-2 roles can derive it from qmgr_name.
     _pr_app: >-
       {{
         app_prefix | default(app_sys_id, true)
         | default(((qmgr_name_normalized | default(qmgr_name)) | lower)[0:3], true)
         | lower
+      }}
+
+- name: "PR — Resolve display identity"
+  ansible.builtin.set_fact:
+    _pr_qmgr_label: >-
+      {{
+        target_repo_pr_qmgr_label
+        | default((_pr_qmgr | upper), true)
+      }}
+    _pr_title_subject: >-
+      {{
+        target_repo_pr_title_subject
+        | default(target_repo_pr_qmgr_label | default((_pr_qmgr | upper), true), true)
       }}
 
 - name: "PR — Build branch prefix"
@@ -199,7 +218,7 @@
     - name: "PR — Stop create from reusing an existing queue manager PR"
       ansible.builtin.fail:
         msg: >-
-          Create resolved {{ _pr_qmgr | upper }}, but open PR
+          Create resolved {{ _pr_qmgr_label }}, but open PR
           {{ _pr_existing_id }} already uses automation branch
           {{ _pr_existing_branch }}. Pending create branches must reserve
           their sequence before a new queue manager is generated. Rerun the
@@ -352,7 +371,7 @@
 
           - Action: {{ target_repo_pr_action_label }}
           - Environment: {{ env_upper }}
-          - Queue manager: {{ _pr_qmgr | upper }}
+          - Queue manager: {{ _pr_qmgr_label }}
           {% if _pr_namespace | string | length > 0 %}
           - Namespace: {{ _pr_namespace }}
           {% endif %}
@@ -411,7 +430,7 @@
     # ── 10. Git Commit & Push ────────────────────────────────
     - name: "PR — Prepare title"
       ansible.builtin.set_fact:
-        _pr_title: "[{{ env_upper }}] {{ target_repo_pr_action_label }} {{ _pr_qmgr | upper }}"
+        _pr_title: "[{{ env_upper }}] {{ target_repo_pr_action_label }} {{ _pr_title_subject }}"
 
     - name: "PR — Prepare manager description"
       ansible.builtin.set_fact:
@@ -422,7 +441,7 @@
           | --- | --- |
           | Action | {{ target_repo_pr_action_label }} |
           | Environment | {{ env_upper }} |
-          | Queue manager | {{ _pr_qmgr | upper }} |
+          | Queue manager | {{ _pr_qmgr_label }} |
           {% if _pr_namespace | string | length > 0 %}
           | Namespace | {{ _pr_namespace }} |
           {% endif %}
@@ -557,7 +576,7 @@
     - name: "PR — Stop duplicate queue manager PR creation"
       ansible.builtin.fail:
         msg: >-
-          Another open PR for {{ _pr_qmgr | upper }} appeared while this job
+          Another open PR for {{ _pr_qmgr_label }} appeared while this job
           was running: {{ _pr_late_existing_branch }}. Automation keeps one open
           PR per queue manager. Rerun this job so it updates that PR instead of
           creating a competing PR. If this run pushed a separate duplicate branch,

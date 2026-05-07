@@ -92,7 +92,7 @@ dummycertmanager_password: >-  # pragma: allowlist secret
   }}
 dummycertmanager_client_id: "MQAutomation"
 dummycertmanager_scope: "certificate:approve,delete,discover,manage,revoke;configuration:manage"
-dummycertmanager_policy_dn: "\\VED\\Policy\\Certificates\\DMQ Automated Certificates"
+dummycertmanager_policy_dn: "\\VED\\Policy\\Certificates\\APP1 Automated Certificates"
 dummycertmanager_validate_certs: true
 
 # ────────────────────────────────────────────────────

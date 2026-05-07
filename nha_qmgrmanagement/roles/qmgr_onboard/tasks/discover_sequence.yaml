@@ -5,7 +5,7 @@
 # and returns the next available 3-digit sequence.
 #
 # Input variables:
-#   app_prefix     - app id from survey, normalized earlier, for example dmq
+#   app_prefix     - app id from survey, normalized earlier, for example app1
 #   env_code       - two-character environment code, for example q2
 #   mq_environment - survey environment, used only when qmgr_root_rel is absent
 #   qmgr_root_rel  - queue manager root path, for example queue_managers/QA2
@@ -49,7 +49,7 @@
 
 - name: "Discover — Parse sequence numbers"
   ansible.builtin.set_fact:
-    # Prefix example: app_prefix=dmq and env_code=q2 produces dmqq2.
+    # Prefix example: app_prefix=app1 and env_code=q2 produces app1q2.
     _qmgr_discovery_app_prefix: "{{ app_prefix | lower }}"
     _qmgr_discovery_prefix: "{{ app_prefix | lower }}{{ env_code | lower }}"
     # Existing directory names under queue_managers/<ENV>.

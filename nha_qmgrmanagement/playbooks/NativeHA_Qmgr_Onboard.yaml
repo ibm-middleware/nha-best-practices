@@ -8,14 +8,14 @@
 # Survey variables:
 #   Create:
 #     qm_action:        Create
-#     app_sys_id:       Application System ID / prefix (e.g. DMQ)
+#     app_sys_id:       Application System ID / prefix (e.g. APP1)
 #     mq_environment:   DEV | QA1 | QA2 | QA3 | PROD
 #     total_volume_24h: Expected 24h message volume (e.g. 1m, 500k, 1k)
 #     avg_msg_size:     Average message size (e.g. 4k, 10m, 100m)
 #   Update:
 #     qm_action:        Update
 #     mq_environment:   DEV | QA1 | QA2 | QA3 | PROD
-#     qmgr_name:        Full Queue Manager Name (e.g. DMQDV001)
+#     qmgr_name:        Full Queue Manager Name (e.g. APP1DV001)
 #     total_volume_24h: Expected 24h message volume (e.g. 1m, 500k, 1k)
 #     avg_msg_size:     Average message size (e.g. 4k, 10m, 100m)
 #

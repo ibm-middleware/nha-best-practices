@@ -35,16 +35,16 @@
 
 - name: "Identity — Derive queue manager and namespace names"
   ansible.builtin.set_fact:
-    # Example: app_prefix=dmq, env_code=q2, sequence_number=003 -> dmqq2003.
+    # Example: app_prefix=app1, env_code=q2, sequence_number=003 -> app1q2003.
     qmgr_name: "{{ app_prefix_normalized }}{{ env_code }}{{ sequence_number }}"
     qmgr_name_upper: "{{ (app_prefix_normalized ~ env_code ~ sequence_number) | upper }}"
-    # Example: dmq-mq-qa2-003.
+    # Example: app1-mq-qa2-003.
     namespace: "{{ app_prefix_normalized }}-mq-{{ env_ns_code }}-{{ sequence_number }}"
 
 - name: "Identity — Derive Vault security zone"
   ansible.builtin.set_fact:
-    # HRA/SRA is selected from the app list in vault_security_zones.
-    _zone: "{{ 'hra' if app_prefix_normalized in vault_security_zones.hra.apps else 'sra' }}"
+    # ZONE1/ZONE2 is selected from the app list in vault_security_zones.
+    _zone: "{{ 'zone1' if app_prefix_normalized in vault_security_zones.zone1.apps else 'zone2' }}"
 
 - name: "Identity — Derive Vault namespace and mount"
   ansible.builtin.set_fact:

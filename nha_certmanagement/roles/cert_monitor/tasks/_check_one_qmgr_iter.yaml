@@ -8,7 +8,7 @@
 #  verify_cert_health.yaml.
 #
 #  INPUT (loop_var from parent):
-#    _qmgr_item.key   — qmgr_name (e.g. "dmqq2001")
+#    _qmgr_item.key   — qmgr_name (e.g. "app1q2001")
 #    _qmgr_item.value  — registry entry dict
 #
 # =============================================================

@@ -47,7 +47,7 @@
 
 - name: Resolve Vault security zone for certificate health verification
   ansible.builtin.set_fact:
-    _zone: "{{ 'hra' if app_prefix_normalized in vault_security_zones.hra.apps else 'sra' }}"
+    _zone: "{{ 'zone1' if app_prefix_normalized in vault_security_zones.zone1.apps else 'zone2' }}"
 
 - name: Resolve Vault namespace and mount for certificate health verification
   ansible.builtin.set_fact:

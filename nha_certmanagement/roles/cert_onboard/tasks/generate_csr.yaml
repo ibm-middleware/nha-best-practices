@@ -63,7 +63,7 @@
   when: cert_type == 'app'
 
 # Route hostnames: {qmgr}-{route_suffix}-{namespace}.{cluster_domain}
-# Example: dmqq2001-ibm-mq-qm-dmq-mq-qa2-001.apps.ocp-cluster1-001.example.lab
+# Example: app1q2001-ibm-mq-qm-app1-mq-qa2-001.apps.ocp-cluster1-001.example.lab
 - name: Add route SANs for {{ cert_type }}
   ansible.builtin.set_fact:
     _current_sans: >-

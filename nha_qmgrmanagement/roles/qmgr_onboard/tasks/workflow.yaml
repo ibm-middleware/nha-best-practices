@@ -18,7 +18,7 @@
 # - Values in vars_files are global configuration. Examples:
 #   env_repo_map, env_branch_map, sizing, regions, vault_security_zones.
 # - AAP survey values are treated as user intent. Examples:
-#   qm_action=Create, app_sys_id=dmq, mq_environment=QA2.
+#   qm_action=Create, app_sys_id=app1, mq_environment=QA2.
 # - set_fact creates runtime facts for later tasks. Examples:
 #   qmgr_name, namespace, qmgr_rel_path, qmgr_size, _target_regions.
 # - Variables starting with "_" are local helper facts used by this role only.
@@ -31,7 +31,7 @@
 #   seq_number is auto-discovered from Git; qmgr_name is first
 #   set in Step 3 as a purely computed output.
 # - Update:
-#   qmgr_name IS provided by the survey (e.g. "dmqdv001").
+#   qmgr_name IS provided by the survey (e.g. "app1dv001").
 #   It is parsed in Step 2 to extract app_sys_id and seq_number,
 #   then re-derived identically in Step 3 as the canonical output.
 #   After Step 3, qmgr_name is always the final authoritative name.
@@ -87,7 +87,7 @@
 #
 # Variable contract — qmgr_name has two distinct roles:
 #
-#   UPDATE:  qmgr_name is the SURVEY INPUT  (e.g. "dmqdv001")
+#   UPDATE:  qmgr_name is the SURVEY INPUT  (e.g. "app1dv001")
 #            → parsed here to extract app_sys_id and seq_number
 #            → reconstructed identically in Step 3 as the final name
 #            → net result: qmgr_name (survey input) == qmgr_name (derived output)
@@ -138,7 +138,7 @@
          true
       ) }}
     sequence_number: "{{ seq_number | default('001') }}"
-    _zone: "{{ 'hra' if app_sys_id | lower in vault_security_zones.hra.apps else 'sra' }}"
+    _zone: "{{ 'zone1' if app_sys_id | lower in vault_security_zones.zone1.apps else 'zone2' }}"
 
 - name: "Step 3 — Compute Vault namespace and mount"
   ansible.builtin.set_fact:
@@ -190,7 +190,7 @@
     mq_version: "{{ mq_versions.PROD if env_upper == 'PROD' else mq_versions.NONPROD }}"
     license_id: "{{ license_ids.PROD if env_upper == 'PROD' else license_ids.NONPROD }}"
     license_use: "{{ 'Production' if env_upper == 'PROD' else 'NonProduction' }}"
-    storage_class_name: "{{ qmgr_size.storage_class | default('lvms-vg1') }}"
+    storage_class_name: "{{ qmgr_size.storage_class | default('standard') }}"
     qmgr_name_upper: "{{ (app_prefix + env_code + sequence_number) | upper }}"
     live_region_lower: "{{ default_deploy_region | default('cluster1') }}"
 

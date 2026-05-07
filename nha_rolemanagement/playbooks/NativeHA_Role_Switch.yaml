@@ -9,7 +9,7 @@
 #
 # AAP survey variables:
 #   mq_environment  - QA2 | PROD
-#   qmgr_name       - Queue manager name, for example dmqq2001
+#   qmgr_name       - Queue manager name, for example app1q2001
 #   new_live_region - Region key to become Live, for example use or cluster2
 #
 # Variables loaded from nativeha_qmgr_control_vars.yaml:

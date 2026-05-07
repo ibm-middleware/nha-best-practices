@@ -8,7 +8,7 @@
 
 # --- Survey Variables (provided by AAP survey or --extra-vars) ---
 # qm_action:        "Create" or "Update"
-# app_sys_id:       Application System ID / SYSID (e.g. "DMQ")
+# app_sys_id:       Application System ID / SYSID (e.g. "APP1")
 # mq_environment:   "DEV", "QA1", "QA2", "QA3", or "PROD"
 # total_volume_24h: Expected 24h message volume (e.g. "1m", "500k")
 # avg_msg_size:     Average message size (e.g. "4k", "10m", "100m")
