@@ -1,0 +1,43 @@
+---
+# ============================================================
+# git_clone_and_configure.yaml — Shared Git Clone + Identity
+# ============================================================
+#
+# Provides a single reusable task file for cloning a target
+# repository and configuring Git identity. Used by:
+#   - NativeHA_Qmgr_Automate_Deployment (onboarding)
+#   - NativeHA_Image_Upgrade
+#   - NativeHA_Role_Switch
+#
+# Required variables from caller:
+#   git_work_dir     - local working directory path
+#   git_repo_url     - remote repository URL
+#   target_branch    - branch to clone
+#   git_user_name    - git config user.name (default: 'MQ Automation')
+#   git_user_email   - git config user.email (default: 'mq-automation@example.lab')
+#
+# ============================================================
+
+- name: "Git — Clean working directory"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}"
+    state: absent
+
+- name: "Git — Clone target repo ({{ target_branch }} branch)"  # noqa name[template]
+  ansible.builtin.git:
+    repo: "{{ git_repo_url }}"
+    dest: "{{ git_work_dir }}"
+    version: "{{ target_branch }}"
+    force: true
+    accept_hostkey: true
+
+- name: "Git — Configure identity"
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  args:
+    chdir: "{{ git_work_dir }}"
+  loop:
+    - ["git", "config", "user.name", "{{ git_user_name | default('MQ Automation') }}"]
+    - ["git", "config", "user.email", "{{ git_user_email | default('mq-automation@example.lab') }}"]
+    - ["git", "config", "core.sshCommand", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"]
+  changed_when: false

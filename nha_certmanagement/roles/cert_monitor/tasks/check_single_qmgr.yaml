@@ -1,0 +1,153 @@
+---
+# =============================================================
+#  check_single_qmgr.yaml — Health Check for One Queue Manager
+# =============================================================
+#
+#  PURPOSE:
+#    Checks all cert types for a single queue manager by:
+#    1. Deriving qmgr_name + namespace from survey inputs
+#    2. Reading registry for existing metadata (if available)
+#    3. Running verify_cert_health.yaml for each cert type
+#    4. Updating the registry with refreshed data
+#    5. Printing a formatted health report
+#
+#  INPUTS (from survey / extra_vars):
+#    app_prefix, mq_environment, sequence_number, instance_type
+#
+# =============================================================
+
+# ── 1. Derive identity ──────────────────────────────────────
+- name: "Monitor — Derive queue manager identity"
+  ansible.builtin.include_tasks: ../cert_common/tasks/derive_identity.yaml
+
+# ── 2. Validate survey inputs ───────────────────────────────
+- name: "Monitor — Validate survey inputs"
+  ansible.builtin.assert:
+    that:
+      - app_prefix is defined and app_prefix | lower is match('^[a-z0-9]{3}$')
+      - mq_environment is defined and mq_environment | upper in ['DEV', 'QA1', 'QA2', 'QA3', 'PROD']
+      - sequence_number is defined and sequence_number is match('^[0-9]{3}$')
+      - instance_type is defined and instance_type in ['single', 'nha', 'nhacrr']
+    fail_msg: >-
+      Survey inputs incomplete for monitoring.
+      Required: app_prefix as 3 alphanumeric characters and sequence_number
+      as 3 digits.
+      Got: app_prefix={{ app_prefix | default('?') }},
+      mq_environment={{ mq_environment | default('?') }},
+      instance_type={{ instance_type | default('?') }}
+    quiet: true
+
+# ── 3. Resolve cert types ───────────────────────────────────
+- name: "Monitor — Resolve cert types"
+  ansible.builtin.set_fact:
+    active_cert_types: "{{ instance_cert_map[instance_type] }}"
+
+- name: "Monitor — Target"
+  ansible.builtin.debug:
+    msg: "Checking {{ qmgr_name | upper }} → {{ active_cert_types | join(', ') }}"
+
+# ── 4. Create temp dir ──────────────────────────────────────
+- name: "Monitor — Create temp dir"
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: _mq_monitor
+  register: _monitor_tmp
+
+# ── 5. Authenticate to DummyCertManager ────────────────────────────────
+- name: "Monitor — Authenticate to DummyCertManager"
+  ansible.builtin.uri:
+    url: "{{ dummycertmanager_url }}{{ dummycertmanager_oauth }}"
+    method: POST
+    body_format: json
+    body:
+      username: "{{ dummycertmanager_username }}"
+      password: "{{ dummycertmanager_password }}"  # pragma: allowlist secret
+      client_id: "{{ dummycertmanager_client_id }}"
+      scope: "{{ dummycertmanager_scope }}"
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    validate_certs: "{{ dummycertmanager_validate_certs }}"
+    status_code: [200, 201]
+  register: _monitor_auth
+
+- name: "Monitor — Store bearer token"
+  ansible.builtin.set_fact:
+    dummycertmanager_token: "{{ _monitor_auth.json.access_token }}"  # pragma: allowlist secret
+
+# ── 6. Try to read existing registry entry for this qmgr ────
+- name: "Monitor — Read registry for existing metadata"
+  ansible.builtin.include_tasks: ../cert_common/tasks/read_registry.yaml
+
+- name: "Monitor — Get existing queue manager entry"
+  ansible.builtin.set_fact:
+    _existing_qmgr_data: "{{ cert_registry[qmgr_name] | default({}) }}"
+
+# ── 7. Initialize report + refresh trackers ──────────────────
+- name: "Monitor — Initialize trackers"
+  ansible.builtin.set_fact:
+    _health_report: []
+    _registry_refresh: {}
+
+# ── 8. Verify each cert type ────────────────────────────────
+- name: "Monitor — Verify queue manager certs"
+  ansible.builtin.include_tasks: verify_cert_health.yaml
+  loop: "{{ active_cert_types }}"
+  loop_control:
+    loop_var: _monitor_cert_type
+    label: "{{ _monitor_cert_type }}"
+  vars:
+    _monitor_qmgr_name: "{{ qmgr_name }}"
+    _monitor_qmgr_name_upper: "{{ qmgr_name_upper }}"
+    _monitor_app_prefix: "{{ app_prefix }}"
+    _monitor_namespace: "{{ namespace }}"
+    _monitor_environment: "{{ mq_environment | upper }}"
+    _monitor_cert_data: "{{ _existing_qmgr_data.certs[_monitor_cert_type] | default({}) }}"
+    _monitor_tmp_dir: "{{ _monitor_tmp.path }}"
+
+# ── 9. Update registry with refreshed data ──────────────────
+- name: "Monitor — Update registry with refreshed health data"
+  ansible.builtin.include_tasks: ../cert_common/tasks/update_registry.yaml
+  vars:
+    registry_update:
+      qmgr_name: "{{ qmgr_name }}"
+      data:
+        app_prefix: "{{ app_prefix }}"
+        environment: "{{ mq_environment | upper }}"
+        sequence_number: "{{ sequence_number }}"
+        instance_type: "{{ instance_type }}"
+        namespace: "{{ namespace }}"
+        last_updated: "{{ now(utc=true) | string }}"
+        certs: "{{ _registry_refresh }}"
+    registry_commit_msg: >-
+      cert monitor: {{ qmgr_name | upper }}
+      checked={{ active_cert_types | join(', ') }}
+  when: _registry_refresh | length > 0
+
+# ── 10. Build summary ───────────────────────────────────────
+- name: "Monitor — Count issues"
+  ansible.builtin.set_fact:
+    _healthy_count: "{{ _health_report | selectattr('status', 'eq', 'healthy') | list | length }}"
+    _issue_count: "{{ _health_report | rejectattr('status', 'eq', 'healthy') | list | length }}"
+    _issues_list: "{{ _health_report | rejectattr('status', 'eq', 'healthy') | list }}"
+
+# ── 11. Print formatted report ──────────────────────────────
+- name: "Monitor — CERTIFICATE HEALTH REPORT"  # noqa jinja[invalid]
+  ansible.builtin.debug:
+    msg: "{{ _report_lines }}"
+  vars:
+    _report_lines: |
+      ═══════════════════════════════════════════════════════════
+        CERTIFICATE HEALTH REPORT
+        Generated: {{ now(utc=true) | string }}
+        Queue Manager: {{ qmgr_name | upper }}
+      ═══════════════════════════════════════════════════════════
+      {% for entry in _health_report %}
+        {{ entry.cert_type | upper }} | {{ entry.status_icon }} | Days: {{ entry.days_remaining }} | Vault: {{ entry.in_vault }} | DummyCertManager: {{ entry.in_dummycertmanager }}
+      {% endfor %}
+      ───────────────────────────────────────────────────────────
+        Healthy: {{ _healthy_count }}  Issues: {{ _issue_count }}
+      {% if _issue_count | int > 0 %}
+        Action Needed: {{ _issues_list | map(attribute='cert_type') | join(', ') }}
+      {% endif %}
+      ═══════════════════════════════════════════════════════════

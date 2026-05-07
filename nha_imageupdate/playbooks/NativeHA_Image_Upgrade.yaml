@@ -1,0 +1,40 @@
+---
+# =============================================================
+# NativeHA_Image_Upgrade.yaml - MQ Version/Image Upgrade Playbook
+# =============================================================
+#
+# Purpose:
+#   Updates only the qm-image-patch.yaml files in each regional
+#   overlay. The base qmgr.yaml remains unchanged.
+#
+# AAP survey variables:
+#   qmgr_name       - Queue manager name, for example dmqq2001
+#   mq_environment  - DEV | QA1 | QA2 | QA3 | PROD
+#   new_mq_version  - New MQ version, for example 9.4.5.0-r2
+#   new_license_id  - Optional. Defaults from environment mapping.
+#
+# Variables loaded from nativeha_qmgr_control_vars.yaml:
+#   env_repo_map / env_branch_map - choose target Git repo and branch
+#   env_qmgr_abbr                 - validates qmgr_name belongs to environment
+#   regions / default_deploy_region - decide which overlay patch files to edit
+#   license_ids                   - fallback license ID when new_license_id is empty
+#   target_repo_change_mode       - direct commit or pull_request publication
+#
+# Variables derived inside the role:
+#   env_upper             - normalized environment, for example QA2
+#   qmgr_name_normalized  - lowercase queue manager path name, for example dmqq2003
+#   instance_type         - nha for non-CRR envs, nhacrr for QA2/PROD
+#   qmgr_rel_path         - target repo path, for example queue_managers/QA2/dmqq2003
+#   _upgrade_image        - full image value written to qm-image-patch.yaml
+# =============================================================
+
+- name: "NativeHA MQ Upgrade - {{ qmgr_name | default('UNDEFINED') | upper }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  roles:
+    - role: nativeha_image_upgrade

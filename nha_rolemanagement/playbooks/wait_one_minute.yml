@@ -1,0 +1,7 @@
+- name: Wait for role propagation
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Sleep for 60 seconds
+      ansible.builtin.pause:
+        seconds: 60

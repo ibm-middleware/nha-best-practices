@@ -1,0 +1,37 @@
+---
+# base/kustomization.yaml — Base layer for queue manager
+# Contains all shared resources that are common across regions.
+# This kustomization is referenced by each overlay's kustomization.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: {{ namespace }}
+labels:
+  - pairs:
+      app.kubernetes.io/name: {{ qmgr_name }}
+      app.kubernetes.io/managed-by: ansible-automation
+resources:
+  - qmgr.yaml
+  - secrets
+{% if enable_prometheus_monitor | default(true) | bool or enable_webui | default(true) | bool %}
+  - monitoring
+{% endif %}
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: {{ qmgr_name }}-mqsc
+    files:
+{% for file in mqsc_files %}
+      - mqsc/{{ file }}
+{% endfor %}
+  - name: {{ qmgr_name }}-ini
+    files:
+{% for file in ini_files %}
+      - ini/{{ file }}
+{% endfor %}
+{% if enable_scripts_configmap | default(true) | bool and script_files | default([]) | length > 0 %}
+  - name: {{ qmgr_name }}-utility-scripts
+    files:
+{% for file in script_files %}
+      - scripts/{{ file }}
+{% endfor %}
+{% endif %}

@@ -1,0 +1,19 @@
+---
+# overlays/{{ current_region }}/kustomization.yaml — Regional overlay
+# This is the ArgoCD Application entry point for this region.
+# It references the shared base and applies region-specific JSON 6902 patches.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+{% if instance_type == 'nhacrr' %}
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: {{ regions[current_region].region_label }}-patch-role.yaml
+{% endif %}
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: qm-image-patch.yaml

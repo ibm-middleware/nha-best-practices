@@ -1,0 +1,160 @@
+---
+# =============================================================
+#  update_registry.yaml — Git-backed Certificate Registry Update
+# =============================================================
+#
+#  PURPOSE:
+#    Clones the repo, reads the cert_inventory.yaml, merges the
+#    new cert data for the current queue manager, writes it back,
+#    and commits + pushes.
+#
+#  CALLED BY:
+#    - cert_onboard (after successful provisioning)
+#    - cert_offboard (after successful revocation)
+#    - cert_monitor (after health check refresh)
+#
+#  REQUIRED VARIABLES:
+#    registry_update:
+#      qmgr_name: "<qmgr_name>"
+#      data:
+#        app_prefix: "..."
+#        environment: "..."
+#        ... (full qmgr entry)
+#
+#    registry_commit_msg: "message for git commit"
+#
+#  INPUTS FROM certs_control_vars.yaml:
+#    cert_git_base_url, cert_git_branch, cert_git_work_dir,
+#    cert_git_user_name, cert_git_user_email, cert_registry_path
+#
+#  LOCAL FACTS:
+#    _existing_registry - current certificates map from Git
+#    _updated_registry  - certificates map after merging registry_update
+#
+# =============================================================
+
+# ── 1. Clone repo ───────────────────────────────────────────
+- name: "Registry — Clean working directory"
+  ansible.builtin.file:
+    path: "{{ cert_git_work_dir }}"
+    state: absent
+
+- name: "Registry — Clone repo ({{ cert_git_branch }} branch)"  # noqa name[template]
+  ansible.builtin.git:
+    repo: "{{ cert_git_base_url }}"
+    dest: "{{ cert_git_work_dir }}"
+    version: "{{ cert_git_branch }}"
+    force: true
+    accept_hostkey: true
+
+- name: "Registry — Configure git identity"
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  args:
+    chdir: "{{ cert_git_work_dir }}"
+  loop:
+    - ["git", "config", "user.name", "{{ cert_git_user_name }}"]
+    - ["git", "config", "user.email", "{{ cert_git_user_email }}"]
+    - ["git", "config", "core.sshCommand", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"]
+  changed_when: false
+
+# ── 2. Read existing registry ────────────────────────────────
+- name: "Registry — Check if inventory file exists"
+  ansible.builtin.stat:
+    path: "{{ cert_git_work_dir }}/{{ cert_registry_path }}"
+  register: _registry_file
+
+- name: "Registry — Read existing inventory"
+  ansible.builtin.slurp:
+    src: "{{ cert_git_work_dir }}/{{ cert_registry_path }}"
+  register: _registry_raw
+  when: _registry_file.stat.exists
+
+- name: "Registry — Parse existing inventory"
+  ansible.builtin.set_fact:
+    # cert_inventory.yaml stores entries under a top-level certificates key.
+    _existing_registry: >-
+      {{ (_registry_raw.content | b64decode | from_yaml).certificates | default({}) }}
+  when: _registry_file.stat.exists
+
+- name: "Registry — Initialize empty registry"
+  ansible.builtin.set_fact:
+    _existing_registry: {}
+  when: not _registry_file.stat.exists
+
+# ── 3. Merge new data ───────────────────────────────────────
+- name: "Registry — Merge entry for {{ registry_update.qmgr_name }}"
+  ansible.builtin.set_fact:
+    # registry_update.qmgr_name is the only entry replaced in this run.
+    _updated_registry: >-
+      {{ _existing_registry | combine({
+           registry_update.qmgr_name: registry_update.data
+         })
+      }}
+
+# ── 4. Write updated registry ───────────────────────────────
+- name: "Registry — Ensure directory exists"
+  ansible.builtin.file:
+    path: "{{ cert_git_work_dir }}/{{ cert_registry_path | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: "Registry — Write updated inventory"
+  ansible.builtin.copy:
+    content: |
+      ---
+      # ============================================================
+      # MQ NativeHA — Certificate Inventory
+      # ============================================================
+      # AUTO-MANAGED — Updated by NativeHA_Cert_Management.yaml
+      # Do NOT edit manually.
+      # Last updated: {{ now(utc=true) | string }}
+      # ============================================================
+
+      {{ {'certificates': _updated_registry} | to_nice_yaml(indent=2) }}
+    dest: "{{ cert_git_work_dir }}/{{ cert_registry_path }}"
+    mode: "0644"
+
+# ── 5. Git commit + push ────────────────────────────────────
+- name: "Registry — Git add"
+  ansible.builtin.command:
+    argv: ["git", "add", "-A"]
+  args:
+    chdir: "{{ cert_git_work_dir }}"
+  changed_when: false
+
+- name: "Registry — Check for changes"
+  ansible.builtin.command:
+    argv: ["git", "diff", "--cached", "--quiet"]
+  args:
+    chdir: "{{ cert_git_work_dir }}"
+  register: _registry_git_diff
+  failed_when: false
+  changed_when: false
+
+- name: "Registry — Git commit"
+  ansible.builtin.command:
+    argv: ["git", "commit", "-m", "{{ registry_commit_msg }}"]
+  args:
+    chdir: "{{ cert_git_work_dir }}"
+  changed_when: true
+  when: _registry_git_diff.rc != 0
+
+- name: "Registry — Git push"
+  ansible.builtin.command:
+    argv: ["git", "push", "origin", "HEAD:refs/heads/{{ cert_git_branch }}"]
+  args:
+    chdir: "{{ cert_git_work_dir }}"
+  changed_when: true
+  when: _registry_git_diff.rc != 0
+
+- name: "Registry — No changes to commit"
+  ansible.builtin.debug:
+    msg: "Registry unchanged — nothing to commit."
+  when: _registry_git_diff.rc == 0
+
+# ── 6. Cleanup ───────────────────────────────────────────────
+- name: "Registry — Cleanup working directory"
+  ansible.builtin.file:
+    path: "{{ cert_git_work_dir }}"
+    state: absent

@@ -1,0 +1,17 @@
+---
+- name: Write to Vault for {{ cert_type }}
+  community.hashi_vault.vault_kv2_write:
+    url: "{{ vault_url }}"
+    auth_method: token
+    token: "{{ vault_cert_token }}"  # pragma: allowlist secret
+    engine_mount_point: "{{ vault_cert_mount_point }}"
+    namespace: "{{ vault_namespace if (vault_namespace | default('') | length > 0) else omit }}"
+    path: "{{ vault_cert_base_path }}/{{ cert_type_vault_subpath[cert_type] }}"
+    data:
+      tls.crt: "{{ _tls_crt }}"
+      tls.key: "{{ _tls_key }}"
+      ca.crt: "{{ _ca_crt }}"
+
+- name: Stored in Vault for {{ cert_type }}
+  ansible.builtin.debug:
+    msg: "Complete — Vault: {{ vault_cert_base_path }}/{{ cert_type_vault_subpath[cert_type] }}"

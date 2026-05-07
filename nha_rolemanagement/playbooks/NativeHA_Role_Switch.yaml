@@ -1,0 +1,37 @@
+---
+# =============================================================
+# NativeHA_Role_Switch.yaml - CRR Role Switch Playbook
+# =============================================================
+#
+# Purpose:
+#   Performs a staged CRR Live/Recovery role switch by updating only
+#   the local role value in each regional role patch.
+#
+# AAP survey variables:
+#   mq_environment  - QA2 | PROD
+#   qmgr_name       - Queue manager name, for example dmqq2001
+#   new_live_region - Region key to become Live, for example use or cluster2
+#
+# Variables loaded from nativeha_qmgr_control_vars.yaml:
+#   regions                    - region keys and labels used for patch file names
+#   env_repo_map/env_branch_map - target Git repo and base branch
+#   qmgr_env_subdir_map         - optional queue_managers/<ENV> target path
+#   target_repo_change_mode     - direct commit or pull_request publication
+#
+# Variables derived inside the role:
+#   requested_live_region - normalized new_live_region value
+#   _current_role_state   - current Live/Recovery state read from patch files
+#   role_switch_stage     - noop, stage1_demote, or stage2_promote
+#   _desired_role_state   - final role value to write per region
+# =============================================================
+
+- name: "NativeHA Role Switch - {{ qmgr_name | default('UNDEFINED') | upper }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  roles:
+    - role: role_switch

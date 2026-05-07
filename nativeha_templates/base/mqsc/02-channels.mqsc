@@ -1,0 +1,11 @@
+* ============================================================
+* MQ Channel Definitions
+* ============================================================
+* WARNING: The IIE_TLS* channels below use SSLCAUTH(REQUIRED)
+*          enforcing mutual TLS. The plain SVRCONN channels
+*          (IIE_CLNT.*) are for non-TLS clients only and should
+*          be disabled for PROD queue managers (qmgr code PR) via CHLAUTH ADDRESSMAP.
+* ============================================================
+
+* Prometheus monitoring (no TLS — internal cluster-only channel)
+DEFINE CHANNEL('MONITOR.SVRCONN') CHLTYPE(SVRCONN) TRPTYPE(TCP) MCAUSER('mqmon') MAXMSGL(4194304) REPLACE

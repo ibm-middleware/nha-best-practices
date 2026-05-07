@@ -1,0 +1,540 @@
+---
+# ============================================================
+# Queue Manager Onboarding Workflow
+# ============================================================
+#
+# This file holds the mutable "do the work" part of onboarding.
+# It is included from tasks/main.yaml inside a block/rescue/always
+# wrapper so git workspace cleanup happens even when a later task
+# fails.
+#
+# Variable origins:
+# - Survey / AAP inputs: qm_action, qmgr_name, app_sys_id,
+#   mq_environment, total_volume_24h, avg_msg_size
+# - Shared config: nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+# - Derived here: target_branch, qmgr_name, namespace, sizing, vault zone
+#
+# How to read variables in this workflow:
+# - Values in vars_files are global configuration. Examples:
+#   env_repo_map, env_branch_map, sizing, regions, vault_security_zones.
+# - AAP survey values are treated as user intent. Examples:
+#   qm_action=Create, app_sys_id=dmq, mq_environment=QA2.
+# - set_fact creates runtime facts for later tasks. Examples:
+#   qmgr_name, namespace, qmgr_rel_path, qmgr_size, _target_regions.
+# - Variables starting with "_" are local helper facts used by this role only.
+# - target_repo_pr_* facts are publish metadata consumed by
+#   nativeha_templates/shared_tasks/target_repo_publish.yaml.
+#
+# Action contract:
+# - Create:
+#   qmgr_name is NOT provided by the survey (per AGENTS.md).
+#   seq_number is auto-discovered from Git; qmgr_name is first
+#   set in Step 3 as a purely computed output.
+# - Update:
+#   qmgr_name IS provided by the survey (e.g. "dmqdv001").
+#   It is parsed in Step 2 to extract app_sys_id and seq_number,
+#   then re-derived identically in Step 3 as the canonical output.
+#   After Step 3, qmgr_name is always the final authoritative name.
+#
+# Target directory structure (Base + Overlays):
+#   <qmgr_name>/
+#   ├── base/                     ← Immutable shared resources
+#   │   ├── kustomization.yaml
+#   │   ├── qmgr.yaml            ← Full CR with PLACEHOLDER values
+#   │   ├── monitoring/
+#   │   ├── secrets/
+#   │   ├── mqsc/
+#   │   ├── ini/
+#   │   └── scripts/
+#   └── overlays/                 ← Day-2 mutable (per region)
+#       ├── <region>/
+#       │   ├── kustomization.yaml  ← refs ../../base + patches
+#       │   ├── role-patch.yaml     ← CRR role (nhacrr only)
+#       │   └── upgrade-patch.yaml  ← version + license + image
+#       └── ...
+#
+# ============================================================
+
+# ── Step 1: Preliminary Derivations & Git Setup ───────────────
+- name: "Step 1 — Set target repo URL, branch, and QM root"
+  ansible.builtin.set_fact:
+    env_upper: "{{ mq_environment | default('DEV') | upper }}"
+    git_repo_url: "{{ env_repo_map[mq_environment | default('DEV') | upper] }}"
+    target_branch: "{{ env_branch_map[mq_environment | default('DEV') | upper] }}"
+    qmgr_root_rel: >-
+      {{
+        ('queue_managers/' ~ qmgr_env_subdir_map[mq_environment | default('DEV') | upper])
+        if (mq_environment | default('DEV') | upper) in (qmgr_env_subdir_map | default({}))
+        else 'queue_managers'
+      }}
+
+- name: "Step 1 — Isolate git working directory for this run"
+  ansible.builtin.set_fact:
+    git_work_dir_base: "{{ git_work_dir }}"
+    git_work_dir: "{{ git_work_dir }}/qmgr_{{ env_upper | lower }}_{{ now(utc=false, fmt='%Y%m%d%H%M%S') }}_{{ 1000000 | random }}"
+
+- name: "Step 1 — Ensure git work base exists"
+  ansible.builtin.file:
+    path: "{{ git_work_dir_base }}"
+    state: directory
+    mode: "0755"
+  check_mode: false
+
+- name: "Step 1 — Clone and configure git repo"
+  ansible.builtin.include_tasks: git_operations.yaml
+
+# ── Step 2: Resolve Identity ──────────────────────────────────
+#
+# Variable contract — qmgr_name has two distinct roles:
+#
+#   UPDATE:  qmgr_name is the SURVEY INPUT  (e.g. "dmqdv001")
+#            → parsed here to extract app_sys_id and seq_number
+#            → reconstructed identically in Step 3 as the final name
+#            → net result: qmgr_name (survey input) == qmgr_name (derived output)
+#
+#   CREATE:  qmgr_name is NOT provided by the survey (per AGENTS.md)
+#            → seq_number is auto-discovered from Git
+#            → qmgr_name is FIRST SET in Step 3 as a purely computed output
+#            → there is no input qmgr_name to conflict with
+#
+# After Step 3, qmgr_name always holds the final authoritative
+# lowercase name regardless of which action ran.
+#
+- name: "Step 2 — Parse survey qmgr_name for Update"
+  when: qm_action_effective == 'Update'
+  block:
+    - name: "Update — Extract app_sys_id and seq_number from survey qmgr_name"
+      ansible.builtin.set_fact:
+        app_sys_id: "{{ qmgr_name[0:3] | lower }}"
+        seq_number: "{{ qmgr_name | lower | regex_replace('^.{5}(\\d{3})$', '\\1') }}"
+
+- name: "Step 2 — Auto-discover sequence number for Create"
+  when: qm_action_effective == 'Create'
+  block:
+    # qmgr_name is NOT in the survey for Create.
+    # Derive prefix + env_code from app_sys_id, then scan Git
+    # to find the next free sequence number.
+    - name: "Create — Derive prefix and env_code from app_sys_id"
+      ansible.builtin.set_fact:
+        app_prefix: "{{ app_sys_id | lower }}"
+        env_code: "{{ env_qmgr_abbr[mq_environment | upper] | lower }}"
+
+    - name: "Create — Discover next free sequence from Git"
+      ansible.builtin.include_tasks: discover_sequence.yaml
+      # sets: seq_number (e.g. "001", "002", ...)
+
+# ── Step 3: Compute remaining derived variables ───────────────
+- name: "Step 3 — Compute derived identity"
+  ansible.builtin.set_fact:
+    app_prefix: "{{ app_sys_id | lower }}"
+    env_lower: "{{ mq_environment | lower }}"
+    env_code: "{{ env_qmgr_abbr[mq_environment | upper] | lower }}"
+    env_ns_code: "{{ env_namespace_abbr[mq_environment | upper] }}"
+    # instance_type_override allows the AAP survey to request 'single'.
+    # Default derivation: QA2/PROD → nhacrr, others → nha.
+    instance_type: >-
+      {{ instance_type_override | default(
+         'nhacrr' if mq_environment | upper in ['QA2', 'PROD'] else 'nha',
+         true
+      ) }}
+    sequence_number: "{{ seq_number | default('001') }}"
+    _zone: "{{ 'hra' if app_sys_id | lower in vault_security_zones.hra.apps else 'sra' }}"
+
+- name: "Step 3 — Compute Vault namespace and mount"
+  ansible.builtin.set_fact:
+    vault_namespace: "{{ vault_security_zones[_zone].label }}"
+    vault_mount: "{{ vault_security_zones[_zone].mount }}"
+
+- name: "Step 3 — Compute storage requirement"
+  ansible.builtin.set_fact:
+    # total_volume_24h is a message COUNT (e.g. '1m' = 1,000,000 messages).
+    # Uses parse_volume_count (SI decimal: 1k=1000, 1m=1000000).
+    _parsed_volume: "{{ total_volume_24h | parse_volume_count | int }}"
+    # avg_msg_size is a BYTE size (e.g. '4k' = 4096 bytes).
+    # Uses human_to_bytes (IEC binary: 1k=1024).
+    _parsed_size: "{{ (avg_msg_size | human_to_bytes) | int }}"
+
+- name: "Step 3 — Compute base storage with 20 percent buffer"
+  ansible.builtin.set_fact:
+    _base_storage: "{{ ((_parsed_volume | int) * (_parsed_size | int) * 1.20) | int }}"
+
+- name: "Step 3 — Apply CRR multiplier"
+  ansible.builtin.set_fact:
+    computed_storage_bytes: >-
+      {{ ((_base_storage | int) * 2) | int if instance_type == 'nhacrr'
+         else (_base_storage | int) }}
+
+- name: "Step 3 — Resolve ordered tier list"
+  ansible.builtin.set_fact:
+    _tier_order: >-
+      {{
+        (sizing_order | default(['small', 'medium', 'large', 'xlarge']))
+        | select('in', sizing[env_upper].keys() | list)
+        | list
+      }}
+
+- name: "Step 3 — Select best-matching size tier"
+  ansible.builtin.set_fact:
+    _matched_tier: "{{ sizing[env_upper] | get_best_mq_tier(computed_storage_bytes, _tier_order, env_upper) }}"
+
+- name: "Step 3 — Expand selected tier properties"
+  ansible.builtin.set_fact:
+    selected_size_tier: "{{ _matched_tier.name }}"
+    qmgr_size: "{{ _matched_tier.specs }}"
+
+- name: "Step 3 — Compute final names and deploy settings"
+  ansible.builtin.set_fact:
+    qmgr_name: "{{ app_prefix }}{{ env_code }}{{ sequence_number }}"
+    namespace: "{{ (app_sys_id ~ '-mq-' ~ env_ns_code ~ '-' ~ sequence_number) | lower }}"
+    # target_branch already set in Step 1 from env_branch_map[env_upper].
+    mq_version: "{{ mq_versions.PROD if env_upper == 'PROD' else mq_versions.NONPROD }}"
+    license_id: "{{ license_ids.PROD if env_upper == 'PROD' else license_ids.NONPROD }}"
+    license_use: "{{ 'Production' if env_upper == 'PROD' else 'NonProduction' }}"
+    storage_class_name: "{{ qmgr_size.storage_class | default('lvms-vg1') }}"
+    qmgr_name_upper: "{{ (app_prefix + env_code + sequence_number) | upper }}"
+    live_region_lower: "{{ default_deploy_region | default('cluster1') }}"
+
+- name: "Step 3 — Compute queue manager relative path"
+  ansible.builtin.set_fact:
+    qmgr_rel_path: "{{ qmgr_root_rel }}/{{ qmgr_name }}"
+
+# ── Step 4: Display computed config ───────────────────────────
+- name: "Step 4 — Computed configuration summary"
+  ansible.builtin.debug:
+    msg:
+      - "═══════════════════════════════════════════════"
+      - "  Queue Manager : {{ qmgr_name | upper }}"
+      - "  Namespace     : {{ namespace }}"
+      - "  Environment   : {{ env_upper }}"
+      - "  Instance Type : {{ instance_type }}"
+      - "  Vault Zone    : {{ _zone | upper }}"
+      - "  Size Tier     : {{ selected_size_tier | default('unknown') }}"
+      - "  Regions       : {{ regions.keys() | list if instance_type == 'nhacrr' else [default_deploy_region | default('cluster1')] }}"
+      - "  Vault NS      : {{ vault_namespace | default('root') }}"
+      - "  Target Branch : {{ target_branch }}"
+      - "  Target Path   : {{ qmgr_rel_path }}"
+      - "  Computed Storage: {{ computed_storage_bytes | int | human_readable }}"
+      - "  QM Storage    : {{ qmgr_size.qmgr_storage }}"
+      - "  Log Storage   : {{ qmgr_size.log_storage }}"
+      - "═══════════════════════════════════════════════"
+
+# ── Step 5: Validate action / idempotency ─────────────────────
+- name: "Step 5 — Check if QM directory exists"
+  ansible.builtin.stat:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}"
+  register: _qmgr_dir
+
+- name: "Step 5 — Validate Update (directory MUST exist)"
+  ansible.builtin.fail:
+    msg: >-
+      QM directory {{ qmgr_rel_path }}/ does NOT exist in {{ target_branch }}.
+      Use qm_action=Create to onboard a new queue manager.
+  when:
+    - qm_action_effective == 'Update'
+    - not _qmgr_dir.stat.exists
+
+- name: "Step 5 — Recompute create target if candidate already exists"
+  when:
+    - qm_action_effective == 'Create'
+    - _qmgr_dir.stat.exists
+  block:
+    - name: "Create — Existing candidate detected, discover next free sequence"
+      ansible.builtin.include_tasks: discover_sequence.yaml
+
+    - name: "Create — Recompute final names after sequence increment"
+      ansible.builtin.set_fact:
+        sequence_number: "{{ seq_number }}"
+        qmgr_name: "{{ app_prefix }}{{ env_code }}{{ seq_number }}"
+        qmgr_rel_path: "{{ qmgr_root_rel }}/{{ app_prefix }}{{ env_code }}{{ seq_number }}"
+        namespace: "{{ (app_sys_id ~ '-mq-' ~ env_ns_code ~ '-' ~ seq_number) | lower }}"
+        qmgr_name_upper: "{{ (app_prefix + env_code + seq_number) | upper }}"
+
+    - name: "Create — Log sequence bump"
+      ansible.builtin.debug:
+        msg: >-
+          Candidate queue manager already existed, so create advanced to
+          {{ qmgr_name | upper }}.
+# ── Step 6: Update existing QueueManager sizing only ───────────
+- name: "Step 6 — Update existing QueueManager sizing only"
+  ansible.builtin.include_tasks: update_sizing.yaml
+  when: qm_action_effective == 'Update'
+
+# ── Step 7: Create Base + Overlays directory structure ────────
+- name: "Step 7 — Compute target regions"
+  ansible.builtin.set_fact:
+    _target_regions: >-
+      {{ regions.keys() | list if instance_type == 'nhacrr'
+         else [default_deploy_region | default('cluster1')] }}
+
+- name: "Step 7 — Create base directories"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - ""
+    - "ini"
+    - "mqsc"
+    - "scripts"
+    - "secrets"
+  when: qm_action_effective == 'Create'
+
+- name: "Step 7 — Create monitoring directory (conditional)"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/monitoring"
+    state: directory
+    mode: "0755"
+  when:
+    - qm_action_effective == 'Create'
+    - >-
+      enable_prometheus_monitor | default(true) | bool
+      or enable_webui | default(true) | bool
+
+- name: "Step 7 — Create overlay directories per region"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}/overlays/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ _target_regions }}"
+  when: qm_action_effective == 'Create'
+
+- name: "Step 7 — Ensure root ArgoCD region directories exist"
+  # ArgoCD Application CRs are placed at the repo root under
+  # argocd_mq_applications/<region>/ so all QMs share one location.
+  # state: directory is idempotent for repeated Create runs.
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/argocd_mq_applications/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ _target_regions }}"
+  when: qm_action_effective == 'Create'
+
+# ── Step 8: Populate base — dynamic file discovery ────────────
+# Discovers ALL files in each source directory so users can add/remove
+# mqsc files, ini files, and scripts without touching automation code.
+- name: "Step 8 — Discover MQSC files"
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/../../nativeha_templates/base/mqsc"
+    patterns: "*"
+    file_type: file
+  register: _mqsc_found
+  when: qm_action_effective == 'Create'
+
+- name: "Step 8 — Discover INI files"
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/../../nativeha_templates/base/ini"
+    patterns: "*"
+    file_type: file
+  register: _ini_found
+  when: qm_action_effective == 'Create'
+
+- name: "Step 8 — Discover script files"
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/../../nativeha_templates/base/scripts"
+    patterns: "*"
+    file_type: file
+  register: _scripts_found
+  when: qm_action_effective == 'Create'
+
+- name: "Step 8 — Set discovered file lists"
+  ansible.builtin.set_fact:
+    mqsc_files: "{{ _mqsc_found.files | map(attribute='path') | map('basename') | sort | list }}"
+    ini_files: "{{ _ini_found.files | map(attribute='path') | map('basename') | sort | list }}"
+    script_files: "{{ _scripts_found.files | map(attribute='path') | map('basename') | sort | list }}"
+  when: qm_action_effective == 'Create'
+
+- name: "Step 8 — Copy MQSC files to base/mqsc"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/mqsc/"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/mqsc/"
+    mode: preserve
+  when: qm_action_effective == 'Create'
+
+- name: "Step 8 — Copy INI files to base/ini"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/ini/"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/ini/"
+    mode: preserve
+  when: qm_action_effective == 'Create'
+
+- name: "Step 8 — Copy scripts to base/scripts"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/scripts/"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/scripts/"
+    mode: preserve
+  when:
+    - qm_action_effective == 'Create'
+    - enable_scripts_configmap | default(true) | bool
+
+# ── Step 9: Populate base/secrets ─────────────────────────────
+- name: "Step 9 — Generate secrets manifests into base/secrets"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/secrets/{{ item.src }}"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/secrets/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: "serviceaccount.yaml.j2", dest: "serviceaccount.yaml" }
+    - { src: "vault_connection.yaml.j2", dest: "vault_connection.yaml" }
+    - { src: "vault_auth.yaml.j2", dest: "vault_auth.yaml" }
+    - { src: "vault_secret_app_pki.yaml.j2", dest: "vault_secret_app_pki.yaml" }
+    - { src: "ibm_entitlement_dummy.yaml.j2", dest: "ibm_entitlement_dummy.yaml" }
+    - src: "vault_secret_nha.yaml.j2"
+      dest: "vault_secret_nha.yaml"
+      condition: "{{ instance_type in ['nha', 'nhacrr'] }}"
+    - src: "vault_secret_nhacrr.yaml.j2"
+      dest: "vault_secret_nhacrr.yaml"
+      condition: "{{ instance_type == 'nhacrr' }}"
+  when:
+    - qm_action_effective == 'Create'
+    - item.condition | default(true) | bool
+
+- name: "Step 9 — Generate base/secrets/kustomization.yaml"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/secrets/secrets_kustomization.yaml.j2"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/secrets/kustomization.yaml"
+    mode: "0644"
+  when: qm_action_effective == 'Create'
+
+# ── Step 10: Populate base/monitoring (conditional) ───────────
+- name: "Step 10 — Generate Prometheus manifests into base/monitoring"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/monitoring/{{ item.src }}"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/monitoring/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: "prometheus_config.yaml.j2", dest: "prometheus_config.yaml" }
+    - { src: "prometheus_deployment.yaml.j2", dest: "prometheus_deployment.yaml" }
+    - { src: "prometheus_service.yaml.j2", dest: "prometheus_service.yaml" }
+  when:
+    - qm_action_effective == 'Create'
+    - enable_prometheus_monitor | default(true) | bool
+
+- name: "Step 10 — Copy WebUI config into base/monitoring"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/monitoring/mqwebuser.xml"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/monitoring/mqwebuser.xml"
+    mode: "0644"
+  when:
+    - qm_action_effective == 'Create'
+    - enable_webui | default(true) | bool
+
+- name: "Step 10 — Generate base/monitoring/kustomization.yaml"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/monitoring/monitoring_kustomization.yaml.j2"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/monitoring/kustomization.yaml"
+    mode: "0644"
+  when:
+    - qm_action_effective == 'Create'
+    - >-
+      enable_prometheus_monitor | default(true) | bool
+      or enable_webui | default(true) | bool
+
+# ── Step 11: Generate base/qmgr.yaml + base/kustomization.yaml
+# For NHA templates, current_region is needed at render time (single region).
+# For CRR templates, the base uses PLACEHOLDER_* literals — each overlay
+# patches all region-specific fields symmetrically.
+# See: docs/crr-base-overlays-rationale.md
+- name: "Step 11 — Set base manifest region defaults"
+  ansible.builtin.set_fact:
+    base_region: "{{ _target_regions | first }}"
+  when: qm_action_effective == 'Create'
+
+- name: "Step 11 — Generate base QueueManager CR (PLACEHOLDER values)"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/qmgr_templates/{{ instance_type_to_template[instance_type] }}"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/qmgr.yaml"
+    mode: "0644"
+  vars:
+    current_region: "{{ base_region }}"
+  when: qm_action_effective == 'Create'
+
+- name: "Step 11 — Generate base/kustomization.yaml"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../nativeha_templates/base/base_kustomization.yaml.j2"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/kustomization.yaml"
+    mode: "0644"
+  when: qm_action_effective == 'Create'
+
+# ── Step 12: Generate regional overlays (patches only) ────────
+- name: "Step 12 — Generate overlay manifests per region"
+  ansible.builtin.include_tasks: generate_overlay.yaml
+  vars:
+    current_region: "{{ overlay_region }}"
+  loop: "{{ _target_regions }}"
+  loop_control:
+    loop_var: overlay_region
+  when: qm_action_effective == 'Create'
+
+# ── Step 13: Generate ArgoCD Application CRs ──────────────────
+# Written to: argocd_mq_applications/<region>/<qmgr>_<region>_argocd_app.yaml
+# All queue managers share this root folder, segregated by region (use/cluster2).
+- name: "Step 13 — Generate ArgoCD Application per region"
+  ansible.builtin.template:
+    src: argocd_app.yaml.j2
+    dest: >-
+      {{
+        [
+          git_work_dir,
+          'argocd_mq_applications',
+          app_region,
+          qmgr_name ~ '_' ~ app_region ~ '_argocd_app.yaml'
+        ] | path_join
+      }}
+    mode: "0644"
+  vars:
+    current_region: "{{ app_region }}"
+  loop: "{{ _target_regions }}"
+  loop_control:
+    loop_var: app_region
+  when: qm_action_effective == 'Create'
+
+# ── Step 14: Publish target repo changes ──────────────────────
+- name: "Step 14 — Prepare create publish metadata"
+  ansible.builtin.set_fact:
+    target_repo_pr_action_slug: "qm-create"
+    target_repo_pr_action_label: "Create QM"
+    target_repo_pr_repo_path: "{{ qmgr_rel_path }}"
+    target_repo_pr_summary: >-
+      Create queue manager {{ qmgr_name | upper }} in {{ env_upper }} with
+      instance type {{ instance_type }} and size tier {{ selected_size_tier }}.
+    target_repo_pr_validation: >-
+      Generated queue manager base, regional overlays, and ArgoCD application
+      manifests for regions {{ _target_regions | join(', ') }}.
+  when: qm_action_effective == 'Create'
+
+- name: "Step 14 — Prepare sizing update publish metadata"
+  ansible.builtin.set_fact:
+    target_repo_pr_action_slug: "qm-sizing-update"
+    target_repo_pr_action_label: "Update QM Sizing"
+    target_repo_pr_repo_path: "{{ qmgr_rel_path }}"
+    target_repo_pr_summary: >-
+      Update sizing only for queue manager {{ qmgr_name | upper }} in
+      {{ env_upper }} to size tier {{ selected_size_tier }}:
+      requests {{ qmgr_size.request_cpu }}/{{ qmgr_size.request_memory }},
+      limits {{ qmgr_size.limits_cpu }}/{{ qmgr_size.limits_memory }},
+      storage {{ qmgr_size.qmgr_storage }},
+      logs {{ qmgr_size.log_storage }}.
+    target_repo_pr_validation: >-
+      Updated and validated only {{ qmgr_rel_path }}/base/qmgr.yaml; no
+      unexpected target-repo files changed before PR metadata generation.
+  when: qm_action_effective == 'Update'
+
+- name: "Step 14 — Publish target repo changes"
+  ansible.builtin.include_tasks: "../../../../nativeha_templates/shared_tasks/target_repo_publish.yaml"
+
+- name: "Step 14 — Onboarding complete"
+  ansible.builtin.debug:
+    msg:
+      - "═══════════════════════════════════════════════"
+      - "  ✅ {{ qm_action_effective | upper }} COMPLETE"
+      - "  Queue Manager : {{ qmgr_name | upper }}"
+      - "  Namespace     : {{ namespace }}"
+      - "  Base Branch   : {{ target_branch }}"
+      - "  Change Mode   : {{ target_repo_pr_result.mode | default(target_repo_change_mode | default('pull_request')) }}"
+      - "  Publish Branch: {{ target_repo_pr_result.branch | default('not created') }}"
+      - "  PR URL        : {{ target_repo_pr_result.pull_request_url | default('not created') }}"
+      - "  Target Path   : {{ qmgr_rel_path }}"
+      - "  Base          : {{ qmgr_rel_path }}/base/"
+      - "  Overlays      : {{ _target_regions | map('regex_replace', '^(.*)$', qmgr_rel_path ~ '/overlays/\\1') | list }}"
+      - "  ArgoCD Apps   : {{ _target_regions | map('regex_replace', '^(.*)$', qmgr_name ~ '_\\1_argocd_app.yaml') | list }}"
+      - "═══════════════════════════════════════════════"

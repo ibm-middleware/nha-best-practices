@@ -1,0 +1,248 @@
+---
+# =============================================================
+#  cert_offboard — Certificate Revocation & Vault Purge
+# =============================================================
+#
+#  PURPOSE:
+#    Removes TLS certificates for a queue manager from both
+#    Vault and DummyCertManager. Used when decommissioning a queue manager
+#    or rotating credentials.
+#
+#  PIPELINE:
+#    Step 1  →  Derive identity (qmgr_name, namespace)
+#    Step 2  →  Safety gate (confirm=yes required)
+#    Step 3  →  Validate inputs
+#    Step 4  →  Resolve cert types from instance_type
+#    Step 5  →  Delete certs from Vault KV
+#    Step 6  →  Authenticate to DummyCertManager
+#    Step 7  →  Revoke + disable certs in DummyCertManager
+#    Step 8  →  Update certificate registry (mark revoked)
+#    Step 9  →  Summary
+#
+#  SAFETY:
+#    - REQUIRES confirm=yes (AAP survey checkbox)
+#    - DummyCertManager OAuth token is revoked in 'always' block
+#    - Vault deletions and DummyCertManager revocations use failed_when
+#      to ensure all cert types are attempted even if one fails
+#
+#  INPUTS (AAP Survey / extra_vars):
+#    - app_prefix       : e.g. "QMM"
+#    - mq_environment   : DEV | QA1 | QA2 | QA3 | PROD
+#    - sequence_number  : e.g. "001"
+#    - instance_type    : single | nha | nhacrr
+#    - confirm          : must be "yes"
+#
+# =============================================================
+
+# ─────────────────────────────────────────────────────────────
+# Step 1: Derive Identity
+# ─────────────────────────────────────────────────────────────
+- name: "Step 1 — Derive queue manager identity"
+  ansible.builtin.include_tasks: ../cert_common/tasks/derive_identity.yaml
+
+# ─────────────────────────────────────────────────────────────
+# Step 2: Safety Gate
+# ─────────────────────────────────────────────────────────────
+- name: "Step 2 — Safety gate (confirm=yes required)"
+  ansible.builtin.fail:
+    msg: >-
+      SAFETY GATE: Set confirm=yes to proceed.
+      This will REVOKE certs for {{ qmgr_name | upper }} in DummyCertManager
+      and DELETE them from Vault. This action cannot be undone.
+  when: confirm | default('') | lower != 'yes'
+
+# ─────────────────────────────────────────────────────────────
+# Step 3: Validate Inputs
+# ─────────────────────────────────────────────────────────────
+- name: "Step 3 — Validate survey inputs"
+  ansible.builtin.assert:
+    that:
+      - app_prefix is defined and app_prefix | lower is match('^[a-z0-9]{3}$')
+      - mq_environment is defined and mq_environment | upper in ['DEV', 'QA1', 'QA2', 'QA3', 'PROD']
+      - sequence_number is defined and sequence_number is match('^[0-9]{3}$')
+      - instance_type is defined and instance_type in ['single', 'nha', 'nhacrr']
+      - qmgr_name is defined and qmgr_name | length > 0
+      - qmgr_name_upper is defined and qmgr_name_upper | length > 0
+      - namespace is defined and namespace | length > 0
+    fail_msg: >-
+      Survey inputs incomplete for offboarding.
+      Required: app_prefix as 3 alphanumeric characters and sequence_number
+      as 3 digits.
+      Got: app_prefix={{ app_prefix | default('?') }},
+      mq_environment={{ mq_environment | default('?') }},
+      instance_type={{ instance_type | default('?') }}
+    quiet: true
+
+- name: "Step 3 — Validate DummyCertManager connection"
+  ansible.builtin.assert:
+    that:
+      - dummycertmanager_url is defined and dummycertmanager_url | length > 0
+      - dummycertmanager_username is defined and dummycertmanager_username | length > 0
+      - dummycertmanager_password is defined and dummycertmanager_password | length > 0
+      - dummycertmanager_client_id is defined and dummycertmanager_client_id | length > 0
+      - dummycertmanager_policy_dn is defined and dummycertmanager_policy_dn | length > 0
+    fail_msg: "DummyCertManager connection vars incomplete for offboarding."
+    quiet: true
+
+- name: "Step 3 — Validate Vault connection"
+  ansible.builtin.assert:
+    that:
+      - vault_url is defined and vault_url | length > 0
+      - vault_cert_token is defined and vault_cert_token | length > 0
+      - vault_cert_mount_point is defined and vault_cert_mount_point | length > 0
+      - vault_cert_base_path is defined and vault_cert_base_path | length > 0
+    fail_msg: >-
+      Vault connection vars incomplete for offboarding. Provide the token via
+      vault_token / hashi_vault_token vars, or VAULT_TOKEN / vault_token env vars.
+    quiet: true
+  when: not (skip_vault_operations | default(false) | bool)
+
+# ─────────────────────────────────────────────────────────────
+# Step 4: Resolve Cert Types
+# ─────────────────────────────────────────────────────────────
+- name: Step 4 — Resolve cert types
+  ansible.builtin.set_fact:
+    active_cert_types: "{{ instance_cert_map[instance_type] }}"
+
+- name: "Step 4 — Offboarding targets"
+  ansible.builtin.debug:
+    msg:
+      - "Queue Manager : {{ qmgr_name | upper }}"
+      - "Environment   : {{ mq_environment | upper }}"
+      - "Instance Type : {{ instance_type }}"
+      - "Cert Types    : {{ active_cert_types | join(', ') }}"
+      - "Vault Path    : {{ vault_cert_base_path }}/"
+
+# ─────────────────────────────────────────────────────────────
+# Steps 5-8: Main Block (with guaranteed token cleanup)
+# ─────────────────────────────────────────────────────────────
+- name: "Steps 5-8 — Vault purge + DummyCertManager revoke"
+  block:
+
+    # ── Step 5: Delete from Vault ────────────────────────────
+    - name: "Step 5 — Dynamically include Vault delete operations"
+      ansible.builtin.include_tasks: vault_delete.yaml
+      when: not (skip_vault_operations | default(false) | bool)
+
+    # ── Step 6: Authenticate to DummyCertManager ───────────────────────
+    - name: "Step 6 — Authenticate to DummyCertManager (OAuth)"
+      ansible.builtin.uri:
+        url: "{{ dummycertmanager_url }}{{ dummycertmanager_oauth }}"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ dummycertmanager_username }}"
+          password: "{{ dummycertmanager_password }}"  # pragma: allowlist secret
+          client_id: "{{ dummycertmanager_client_id }}"
+          scope: "{{ dummycertmanager_scope }}"
+        headers:
+          accept: "application/json"
+          content-type: "application/json"
+        validate_certs: "{{ dummycertmanager_validate_certs }}"
+        status_code: [200, 201]
+      register: _dummycertmanager_auth
+
+    - name: "Step 6 — Store bearer token"
+      ansible.builtin.set_fact:
+        dummycertmanager_token: "{{ _dummycertmanager_auth.json.access_token }}"  # pragma: allowlist secret
+
+    # ── Step 7: Revoke + Disable in DummyCertManager ───────────────────
+    - name: "Step 7 — Revoke in DummyCertManager"
+      ansible.builtin.uri:
+        url: "{{ dummycertmanager_url }}{{ dummycertmanager_revoke }}"
+        method: POST
+        headers:
+          accept: "application/json"
+          Authorization: "Bearer {{ dummycertmanager_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          CertificateDN: "{{ dummycertmanager_policy_dn }}\\{{ qmgr_name }}_{{ cert_type_csr_suffix[item] }}"
+          Reason: "{{ dummycertmanager_revoke_reason }}"
+          Comments: "{{ dummycertmanager_revoke_comments }}"
+          Disable: "{{ dummycertmanager_revoke_disable }}"
+        validate_certs: "{{ dummycertmanager_validate_certs }}"
+        status_code: [200, 201, 202, 204]
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+
+    # ── Step 8: Update Certificate Registry ────────────────────
+    - name: "Step 8 — Build revoked registry entries"
+      ansible.builtin.set_fact:
+        _revoked_certs: >-
+          {{ _revoked_certs | default({}) | combine({
+               item: {
+                 'status': 'revoked',
+                 'common_name': cert_common_name,
+                 'thumbprint': '',
+                 'not_before': '',
+                 'not_after': '',
+                 'days_remaining': 0,
+                 'dummycertmanager_dn': dummycertmanager_policy_dn ~ '\\' ~ qmgr_name ~ '_' ~ cert_type_csr_suffix[item],
+                 'dummycertmanager_guid': '',
+                 'vault_path': vault_cert_base_path ~ '/' ~ cert_type_vault_subpath[item],
+                 'last_action': 'offboard',
+                 'last_action_date': now(utc=true) | string
+               }
+             })
+          }}
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Step 8 — Update certificate registry"
+      ansible.builtin.include_tasks: ../cert_common/tasks/update_registry.yaml
+      vars:
+        registry_update:
+          qmgr_name: "{{ qmgr_name }}"
+          data:
+            app_prefix: "{{ app_prefix }}"
+            environment: "{{ mq_environment | upper }}"
+            sequence_number: "{{ sequence_number }}"
+            instance_type: "{{ instance_type }}"
+            namespace: "{{ namespace }}"
+            last_updated: "{{ now(utc=true) | string }}"
+            certs: "{{ _revoked_certs }}"
+        registry_commit_msg: >-
+          cert offboard: {{ qmgr_name | upper }}
+          revoked={{ active_cert_types | join(', ') }}
+
+    # ── Step 9: Summary ──────────────────────────────────────
+    - name: "Step 9 — CERT OFFBOARDING COMPLETE"
+      ansible.builtin.debug:
+        msg:
+          - "═══════════════════════════════════════════════"
+          - "Queue Manager : {{ qmgr_name | upper }}"
+          - "Environment   : {{ mq_environment | upper }}"
+          - "Certs Revoked : {{ active_cert_types | join(', ') }}"
+          - "Vault Purged  : {{ vault_cert_base_path }}/"
+          - "DummyCertManager Status : disabled"
+          - "Registry      : Updated (revoked) ✅"
+          - "═══════════════════════════════════════════════"
+
+  # ── Error Handler ──────────────────────────────────────────
+  rescue:
+    - name: "FAILED — Partial cleanup may have occurred"
+      ansible.builtin.debug:
+        msg: >-
+          Certificate offboarding FAILED for {{ qmgr_name | upper }}.
+          Some Vault deletions or DummyCertManager revocations may have succeeded.
+
+    - name: "FAILED — Re-raise for AAP"
+      ansible.builtin.fail:
+        msg: "Certificate offboarding failed. See task output above."
+
+  # ── Guaranteed Cleanup ─────────────────────────────────────
+  always:
+    - name: "Cleanup — Revoke DummyCertManager OAuth token"
+      ansible.builtin.uri:
+        url: "{{ dummycertmanager_url }}{{ dummycertmanager_token_revoke }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ dummycertmanager_token }}"
+        validate_certs: "{{ dummycertmanager_validate_certs }}"
+        status_code: [200, 401]
+      when: dummycertmanager_token is defined
+      failed_when: false

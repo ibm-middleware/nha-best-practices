@@ -1,0 +1,113 @@
+---
+# =============================================================
+#  submit_and_store.yaml — DummyCertManager Submit → Store in Vault
+# =============================================================
+#
+#  PURPOSE:
+#    Takes a generated CSR, submits it to DummyCertManager TPP for signing
+#    using the community.general.dummycertmanager_certificate module (company
+#    standard), and stores all artifacts in Vault KV.
+#
+#  CALLED WITH:
+#    cert_type    — loop var: app | nha | nhacrr
+#
+#  REQUIRES:
+#    cert_tmp_dir — contains the generated .key and .csr files
+#    dummycertmanager_token — valid OAuth bearer token (from main.yml)
+#
+#  STORES IN VAULT:
+#    Path: {mount}/data/{vault_cert_base_path}/{cert_type_vault_subpath}
+#    Keys:
+#      tls.crt — Leaf certificate (PEM)
+#      tls.key — Private key (PEM)
+#      ca.crt  — CA chain (PEM, root-first)
+#
+#  DUMMYCERTMANAGER INTEGRATION:
+#    Uses community.general.dummycertmanager_certificate module which handles:
+#    - CSR submission
+#    - Automatic polling until cert is issued
+#    - Certificate retrieval with chain
+#
+# =============================================================
+
+# ── 1. Set file paths ────────────────────────────────────────
+- name: Set certificate file paths for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _cert_key_path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.key"
+    _cert_csr_path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.csr"
+    _cert_crt_path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.crt"
+    _cert_chain_path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}_chain.crt"
+
+# ── 2. Submit CSR to DummyCertManager using company standard module ────
+- name: Request certificate from DummyCertManager for {{ cert_type }}
+  community.general.dummycertmanager_certificate:
+    url: "{{ dummycertmanager_url }}"
+    access_token: "{{ dummycertmanager_token }}"  # pragma: allowlist secret
+    zone: "{{ dummycertmanager_policy_dn }}"
+    common_name: "{{ cert_common_name }}"
+    csr_path: "{{ _cert_csr_path }}"
+    certificate_path: "{{ _cert_crt_path }}"
+    chain_path: "{{ _cert_chain_path }}"
+    privatekey_path: "{{ _cert_key_path }}"
+    timeout: "{{ dummycertmanager_poll_retries | int * dummycertmanager_poll_delay | int }}"
+    validate_certs: "{{ dummycertmanager_validate_certs }}"
+  register: _dummycertmanager_cert_result
+
+- name: Certificate issued for {{ cert_type }}
+  ansible.builtin.debug:
+    msg: "DummyCertManager issued certificate for {{ cert_type }} - CN: {{ cert_common_name }}"
+
+# ── 3. Read certificate files ────────────────────────────────
+- name: Read leaf certificate for {{ cert_type }}
+  ansible.builtin.slurp:
+    src: "{{ _cert_crt_path }}"
+  register: _slurp_crt
+
+- name: Read CA chain for {{ cert_type }}
+  ansible.builtin.slurp:
+    src: "{{ _cert_chain_path }}"
+  register: _slurp_chain
+
+- name: Read private key for {{ cert_type }}
+  ansible.builtin.slurp:
+    src: "{{ _cert_key_path }}"
+  register: _slurp_key
+
+# ── 4. Prepare certificate data for Vault ────────────────────
+- name: Prepare certificate data for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _tls_crt: "{{ _slurp_crt.content | b64decode | trim }}"
+    _tls_key: "{{ _slurp_key.content | b64decode | trim }}"
+    _ca_crt: "{{ _slurp_chain.content | b64decode | trim }}"
+
+# ── 5. Write to HashiCorp Vault KV ───────────────────────────
+- name: "Dynamically include Vault write operations"
+  ansible.builtin.include_tasks: vault_write.yaml
+  when: not (skip_vault_operations | default(false) | bool)
+
+# ── 6. Extract certificate metadata for registry ─────────────
+- name: Extract signed cert info for registry — {{ cert_type }}
+  community.crypto.x509_certificate_info:
+    path: "{{ _cert_crt_path }}"
+  register: _signed_cert_info
+
+# ── 7. Build registry entry ──────────────────────────────────
+- name: Build registry entry for {{ cert_type }}
+  ansible.builtin.set_fact:
+    registry_cert_data: >-
+      {{ registry_cert_data | default({}) | combine({
+           cert_type: {
+             'status': 'active',
+             'common_name': _signed_cert_info.subject.commonName | default(cert_common_name),
+             'thumbprint': _signed_cert_info.fingerprints.sha256 | default(''),
+             'not_before': _signed_cert_info.not_before | default(''),
+             'not_after': _signed_cert_info.not_after | default(''),
+             'days_remaining': ((_signed_cert_info.not_after | to_datetime('%Y%m%d%H%M%SZ')) - (now(utc=true))).days | int,
+             'dummycertmanager_dn': dummycertmanager_policy_dn ~ '\\' ~ qmgr_name ~ '_' ~ cert_type_csr_suffix[cert_type],
+             'dummycertmanager_guid': _dummycertmanager_cert_result.certificate_guid | default(''),
+             'vault_path': vault_cert_base_path ~ '/' ~ cert_type_vault_subpath[cert_type],
+             'last_action': cert_actions[cert_type].action | default('onboard'),
+             'last_action_date': now(utc=true) | string
+           }
+         })
+      }}

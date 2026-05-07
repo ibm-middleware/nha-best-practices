@@ -1,0 +1,27 @@
+* ============================================================
+* MQ Security Baseline — CHLAUTH + AUTHREC
+* ============================================================
+* NOTE: SSLPEER patterns below use WILDCARDS for lab/PoC.
+*       For PROD queue managers (qmgr code PR), replace CN=* with exact CN matching
+*       your client certificate Issuer/Subject DNs.
+* ============================================================
+
+* Enable CHLAUTH globally
+ALTER QMGR CHLAUTH(ENABLED)
+
+* Allow the internal Prometheus exporter to use the channel MCAUSER.
+* Without this rule, CHLAUTH can block the SVRCONN before AUTHREC is evaluated.
+SET CHLAUTH('MONITOR.SVRCONN') TYPE(ADDRESSMAP) ADDRESS('*') USERSRC(CHANNEL) ACTION(REPLACE)
+
+* Authorize Prometheus monitor (mqmon) — minimal read-only
+SET AUTHREC OBJTYPE(QMGR) PRINCIPAL('mqmon') AUTHADD(CONNECT,INQ,DSP)
+SET AUTHREC OBJTYPE(TOPIC) PROFILE('SYSTEM.BASE.TOPIC') PRINCIPAL('mqmon') AUTHADD(SUB,DSP)
+SET AUTHREC OBJTYPE(TOPIC) PROFILE('SYSTEM.ADMIN.TOPIC') PRINCIPAL('mqmon') AUTHADD(SUB,DSP)
+SET AUTHREC OBJTYPE(QUEUE) PROFILE('SYSTEM.ADMIN.COMMAND.QUEUE') PRINCIPAL('mqmon') AUTHADD(PUT,INQ)
+SET AUTHREC OBJTYPE(QUEUE) PROFILE('SYSTEM.DEFAULT.MODEL.QUEUE') PRINCIPAL('mqmon') AUTHADD(PUT,GET,INQ,DSP,BROWSE)
+SET AUTHREC OBJTYPE(QUEUE) PROFILE('SYSTEM.MANAGED.NDURABLE') PRINCIPAL('mqmon') AUTHADD(PUT,GET,INQ,DSP,BROWSE)
+SET AUTHREC PROFILE('SYSTEM.ADMIN.**') OBJTYPE(QUEUE) PRINCIPAL('mqmon') AUTHADD(PUT,GET,INQ,BROWSE)
+SET AUTHREC PROFILE('**') OBJTYPE(QUEUE) PRINCIPAL('mqmon') AUTHADD(INQ,BROWSE)
+SET AUTHREC PROFILE('**') OBJTYPE(CHANNEL) PRINCIPAL('mqmon') AUTHADD(DSP)
+
+REFRESH SECURITY TYPE(AUTHSERV)

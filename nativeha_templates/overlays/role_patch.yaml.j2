@@ -1,0 +1,35 @@
+---
+# {{ regions[current_region].region_label }}-patch-role.yaml
+# Symmetric region patch — ALL region-specific fields are patched.
+# During role switch, ONLY the role value changes.
+# See: docs/crr-base-overlays-rationale.md
+#
+# Managed by:
+#   - NativeHA_Qmgr_Onboard (initial generation)
+#   - NativeHA_Role_Switch   (Day-2 role swap — edits role value only)
+
+# ── Labels ─────────────────────────────────────────────────────
+- op: replace
+  path: /metadata/labels/app.kubernetes.io~1instance
+  value: {{ qmgr_name }}-{{ current_region }}
+- op: replace
+  path: /metadata/labels/mq.ibm.com~1region
+  value: {{ current_region }}
+
+# ── NativeHA Group — local ─────────────────────────────────────
+- op: replace
+  path: /spec/queueManager/availability/nativeHAGroups/local/name
+  value: {{ current_region }}
+- op: replace
+  path: /spec/queueManager/availability/nativeHAGroups/local/role
+  value: {{ crr_role | trim }}
+
+# ── NativeHA Group — remotes ───────────────────────────────────
+{% for rname, rinfo in regions.items() if rname != current_region %}
+- op: replace
+  path: /spec/queueManager/availability/nativeHAGroups/remotes/{{ loop.index0 }}/name
+  value: {{ rname }}
+- op: replace
+  path: /spec/queueManager/availability/nativeHAGroups/remotes/{{ loop.index0 }}/addresses/0
+  value: "{{ qmgr_name }}-ibm-mq-nhacrr-{{ namespace }}.{{ rinfo.cluster_domain }}:{{ crr_replication_port }}"
+{% endfor %}

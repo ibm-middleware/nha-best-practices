@@ -1,0 +1,423 @@
+---
+# ============================================================
+# MQ NativeHA Automation — Central Configuration
+# ============================================================
+# ALL configurable values live here. Nothing is hardcoded in
+# playbooks, roles, or templates. Update this file to switch
+# between lab / company environments.
+# ============================================================
+
+# --- IBM MQ Operator Version & Licensing ---
+mq_versions:
+  NONPROD: "9.4.3.1-r1"
+  PROD: "9.4.5.0-r1"
+
+license_ids:
+  NONPROD: "L-DUMMY-LICENSE-NONPROD"
+  PROD: "L-DUMMY-LICENSE-PROD"
+
+# --- Node Scheduling ---
+# All MQ pods use taint/toleration: mqha=true:NoSchedule
+node_selector_key: "mqha"
+node_selector_value: "true"
+
+# --- Git Configuration ---
+# Dedicated repo per environment — same SSH key is used for all repos.
+# QA1 and QA2 intentionally share the QA repo, and are separated by
+# queue_managers/QA1/ and queue_managers/QA2/ folders in that repo.
+# Each repo uses its own 'develop' branch as the deployment target.
+
+# Per-environment target repository URLs
+env_repo_map:
+  DEV: "git@bitbucket.org:example/mq-nativeha-dev.git"
+  QA1: "git@bitbucket.org:example/mq-nativeha-qa.git"
+  QA2: "git@bitbucket.org:example/mq-nativeha-qa.git"
+  QA3: "git@bitbucket.org:example/mq-nativeha-qa3.git"
+  PROD: "git@bitbucket.org:example/mq-nativeha-prod.git"
+
+# Environments listed here are written below queue_managers/<ENV>/.
+# Environments not listed keep the legacy queue_managers/<qmgr_name>/ layout.
+qmgr_env_subdir_map:
+  QA1: "QA1"
+  QA2: "QA2"
+
+# Target branch in each dedicated repo (all use 'develop')
+env_branch_map:
+  DEV: "develop"
+  QA1: "develop"
+  QA2: "develop"
+  QA3: "develop"
+  PROD: "develop"
+
+# Git commit identity (used for automation commits)
+git_user_name: "MQ Automation"
+git_user_email: "mq-automation@example.lab"
+
+# --- Temp working directory for git clone operations ---
+git_work_dir: "/tmp/mqnativeha_automation"
+
+# --- Target Repository Publish Mode ---
+# direct:
+#   Commit generated artifacts directly to env_branch_map[ENV].
+#   Useful for lab demos where approval workflow is intentionally skipped.
+# pull_request:
+#   Push a feature branch and create/update a Bitbucket pull request.
+#   This is the production governance model.
+target_repo_change_mode: "direct"
+
+# --- Bitbucket Pull Request Automation ---
+# Used when target_repo_change_mode is "pull_request".
+# Backend selection:
+#   The active PR backend is always:
+#     nativeha_templates/shared_tasks/target_repo_pr.yaml
+#   Switch backends by copying one file from setup/pr_backends/.
+# Credentials injected by AAP environment variables:
+#   On-prem: BITBUCKET_INTERNAL_TOKEN or BITBUCKET_TOKEN
+#   Cloud: BITBUCKET_USERNAME plus BITBUCKET_CLOUD_TOKEN or BITBUCKET_TOKEN
+#   On-prem fallback: BITBUCKET_USERNAME + BITBUCKET_PASSWORD
+bitbucket_cloud_api_url: "https://api.bitbucket.org/2.0"
+# Override below only when auto-detection from git_repo_url fails:
+# bitbucket_internal_api_url: ""
+# bitbucket_workspace: ""
+# bitbucket_project_key: ""
+# bitbucket_repo_slug: ""
+bitbucket_validate_certs: true
+
+# --- MQ Container Image (Internal Registry) ---
+# When using an internal/mirrored registry instead of icr.io, set these.
+# The operator uses spec.queueManager.image when provided.
+# Full image at render time: {{ mq_image_registry }}/{{ mq_image_repository }}:{{ mq_version }}
+mq_image_registry: "services.example.lab:5000"
+mq_image_repository: "ibm-mq/mq"
+
+# --- Regions ---
+# Each key is a short region code used in directory names and ArgoCD apps.
+# cluster_domain: the wildcard apps domain for that OCP cluster.
+regions:
+  cluster1:
+    region_label: "east"
+    cluster_domain: "apps.ocp-cluster1-001.example.lab"
+    # Company example:
+    # cluster_domain: "apps.ocp-cluster1qa01.ocp-cluster1.qa.aws.example.lab"
+  cluster2:
+    region_label: "west"
+    cluster_domain: "apps.ocp-cluster2-001.example.lab"
+    # Company example:
+    # cluster_domain: "apps.ocp-uswqa01.ocp-cluster2.qa.aws.example.lab"
+
+# Default deploy region when lab has only one cluster
+default_deploy_region: "cluster1"
+
+
+# --- Environment Abbreviation Maps ---
+# Used by the automation to build namespace and qmgr names.
+# Namespace uses 3-char codes; Queue Manager uses 2-char codes.
+# Pattern: namespace = <SYSID>-MQ-<3-CHAR-ENV>-<SEQ>
+#          qmgr     = <SYSID><2-CHAR-ENV><SEQ>
+# Note: PROD queue manager names use the 2-char code "PR".
+env_namespace_abbr:
+  DEV: "DEV"
+  QA1: "QA1"
+  QA2: "QA2"
+  QA3: "QA3"
+  PROD: "PROD"
+
+env_qmgr_abbr:
+  DEV: "DV"
+  QA1: "Q1"
+  QA2: "Q2"
+  QA3: "Q3"
+  PROD: "PR"
+
+# --- Sizing tier order (smallest → largest) for auto-match ---
+# When auto-computing sizing, iterate these in order and pick
+# the first tier whose qmgr_storage >= computed requirement.
+sizing_order:
+  - small
+  - medium
+  - large
+  - xlarge
+
+# --- ArgoCD ---
+argocd_namespace: "openshift-gitops"
+argocd_project: "default"
+
+# --- Certificate Management ---
+# Vault Secrets Operator (VSO) handles all mTLS and TLS certificates
+# by syncing pre-provisioned material from Vault KV v2 into K8s Secrets.
+# VSO triggers rolling restarts when certs change in Vault.
+
+# --- MQ Web Console Configuration ---
+# Matches client template: web.console.authentication/authorization/enabled/manualConfig
+web_enabled: true
+web_authentication: "manual"
+web_authorization: "manual"
+web_configmap: "webconsole-config"    # ConfigMap name suffix: {{ qmgr_name }}-webconsole-config
+
+# --- MQ Operator Built-in Metrics ---
+# Enables the operator's native Prometheus endpoint (metrics.tls.provider: openshift)
+enable_metrics: true
+
+# --- CRR TLS Cipher ---
+# Used in nativeHAGroups.local.tls.cipherSpec for CRR queue managers
+crr_cipher: "ANY_TLS12_OR_HIGHER"
+
+# --- CRR Replication Port ---
+# Port used for nativeHAGroups.remotes[].addresses (443 for OCP routes via TLS passthrough)
+crr_replication_port: 443
+
+# --- Vault Secrets Operator (VSO) ---
+# Replaces ESO — uses VaultStaticSecret CRDs for static cert sync
+vso_vault_connection_name: "{{ app_prefix }}-vault-connection"
+vso_vault_auth_name: "{{ app_prefix }}-vault-auth"
+vso_vault_role: "{{ vault_security_zones[_zone].vso_role }}"
+vso_service_account: "{{ vault_security_zones[_zone].vso_sa }}"
+vso_kubernetes_auth_mount: "{{ vault_security_zones[_zone].auth_mount | default('kubernetes') }}"
+vso_vault_skip_tls: false
+vso_vault_ca_secret: ""             # Set to a K8s secret name if Vault uses a private CA
+vso_refresh_after: "60s"             # How often VSO re-checks Vault for cert changes
+
+# Vault URL (used by VaultConnection CR)
+vault_url: "https://services.example.lab:8200"
+
+# --- Vault Security Zones ---
+# Logic: If app_sys_id is in 'hra.apps', use hra settings. Otherwise, default to sra.
+# NOTE:
+# - 'label' is the Vault Enterprise namespace value sent as X-Vault-Namespace.
+#   Leave it blank when using the root namespace or Vault Community Edition.
+# - When 'label' is set, keep 'mount' relative to that Vault namespace
+#   (for example "kv" instead of "hra/kv" if the namespace itself is "hra").
+# - 'auth_mount' is the Kubernetes auth mount path inside that Vault namespace.
+vault_security_zones:
+  hra:
+    mount: "hra/kv"
+    label: ""                        # Example for Enterprise: "hra"
+    auth_mount: "kubernetes"
+    vso_role: "{{ app_prefix }}-hra-vso-role"
+    vso_sa: "{{ app_prefix }}-hra-vso-sa"
+    apps: ["dmq", "amq", "mqp"]
+  sra:
+    mount: "sra/kv"
+    label: ""                        # Example for Enterprise: "sra"
+    auth_mount: "kubernetes"
+    vso_role: "{{ app_prefix }}-sra-vso-role"
+    vso_sa: "{{ app_prefix }}-sra-vso-sa"
+
+# Vault role will be derived dynamically in the playbook based on the zone:
+# vso_vault_role: "{{ vault_security_zones[_zone].vso_role }}"
+
+# --- Sizing Matrix ---
+# sizing[ENVIRONMENT][SIZE] defines CPU, memory, storage, and log sizing.
+# request = normal operating resources; limits = burst ceiling
+sizing:
+  DEV:
+    small:
+      request_cpu: "250m"
+      limits_cpu: "500m"
+      request_memory: "512Mi"
+      limits_memory: "1Gi"
+      qmgr_storage: "500Mi"
+      log_storage: "500Mi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    medium:
+      request_cpu: "500m"
+      limits_cpu: "1"
+      request_memory: "1Gi"
+      limits_memory: "2Gi"
+      qmgr_storage: "1Gi"
+      log_storage: "1Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+  QA1:
+    small:
+      request_cpu: "250m"
+      limits_cpu: "500m"
+      request_memory: "512Mi"
+      limits_memory: "1Gi"
+      qmgr_storage: "500Mi"
+      log_storage: "500Mi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    medium:
+      request_cpu: "500m"
+      limits_cpu: "1"
+      request_memory: "1Gi"
+      limits_memory: "2Gi"
+      qmgr_storage: "1Gi"
+      log_storage: "1Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+  QA2:
+    small:
+      request_cpu: "300m"
+      limits_cpu: "500m"
+      request_memory: "512Mi"
+      limits_memory: "1Gi"
+      qmgr_storage: "1Gi"
+      log_storage: "1Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    medium:
+      request_cpu: "500m"
+      limits_cpu: "1"
+      request_memory: "1Gi"
+      limits_memory: "2Gi"
+      qmgr_storage: "5Gi"
+      log_storage: "5Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    large:
+      request_cpu: "1"
+      limits_cpu: "2"
+      request_memory: "2Gi"
+      limits_memory: "4Gi"
+      qmgr_storage: "10Gi"
+      log_storage: "20Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    xlarge:
+      request_cpu: "2"
+      limits_cpu: "4"
+      request_memory: "4Gi"
+      limits_memory: "8Gi"
+      qmgr_storage: "20Gi"
+      log_storage: "40Gi"
+      log_file_pages: 65536
+      storage_class: "lvms-vg1"
+  QA3:
+    small:
+      request_cpu: "300m"
+      limits_cpu: "500m"
+      request_memory: "512Mi"
+      limits_memory: "1Gi"
+      qmgr_storage: "1Gi"
+      log_storage: "1Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    medium:
+      request_cpu: "500m"
+      limits_cpu: "1"
+      request_memory: "1Gi"
+      limits_memory: "2Gi"
+      qmgr_storage: "5Gi"
+      log_storage: "5Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    large:
+      request_cpu: "1"
+      limits_cpu: "2"
+      request_memory: "2Gi"
+      limits_memory: "4Gi"
+      qmgr_storage: "10Gi"
+      log_storage: "20Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    xlarge:
+      request_cpu: "2"
+      limits_cpu: "4"
+      request_memory: "4Gi"
+      limits_memory: "8Gi"
+      qmgr_storage: "20Gi"
+      log_storage: "40Gi"
+      log_file_pages: 65536
+      storage_class: "lvms-vg1"
+  PROD:
+    small:
+      request_cpu: "500m"
+      limits_cpu: "1"
+      request_memory: "1Gi"
+      limits_memory: "2Gi"
+      qmgr_storage: "5Gi"
+      log_storage: "5Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    medium:
+      request_cpu: "1"
+      limits_cpu: "2"
+      request_memory: "2Gi"
+      limits_memory: "4Gi"
+      qmgr_storage: "10Gi"
+      log_storage: "20Gi"
+      log_file_pages: 32768
+      storage_class: "lvms-vg1"
+    large:
+      request_cpu: "2"
+      limits_cpu: "4"
+      request_memory: "4Gi"
+      limits_memory: "8Gi"
+      qmgr_storage: "20Gi"
+      log_storage: "40Gi"
+      log_file_pages: 65536
+      storage_class: "lvms-vg1"
+    xlarge:
+      request_cpu: "4"
+      limits_cpu: "8"
+      request_memory: "8Gi"
+      limits_memory: "16Gi"
+      qmgr_storage: "50Gi"
+      log_storage: "100Gi"
+      log_file_pages: 65536
+      storage_class: "lvms-vg1"
+
+# --- Monitoring & WebUI ---
+# Toggles controlling what goes into base/monitoring/.
+# When disabled, the corresponding resources are NOT generated into the target repo.
+enable_prometheus_monitor: true
+enable_webui: true
+
+# Exporter image — from ibm-messaging/mq-metric-samples (must be built and pushed)
+prometheus_exporter_image: "services.example.lab:5000/mq-tools/mq-metric-prometheus:5.7.1"
+
+# SVRCONN channel used by the exporter (must exist in MQSC)
+prometheus_monitor_channel: "MONITOR.SVRCONN"
+
+# MQ listener port (default inside the container)
+prometheus_mq_port: 1414
+
+# Exporter metrics port (IANA-registered 9157 for MQ Prometheus)
+prometheus_metrics_port: 9157
+
+# Exporter config options (matching mq-metric-samples config.common.yaml)
+prometheus_poll_interval: "30s"
+prometheus_rediscover_interval: "1h"
+prometheus_log_level: "INFO"
+prometheus_keep_running: true
+
+# Exporter resource limits
+prometheus_resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+# Objects to monitor (glob patterns, matching mq-metric-samples objects section)
+prometheus_monitored_queues:
+  - "*"
+  - "!SYSTEM.*"
+  - "!AMQ.*"
+prometheus_monitored_channels:
+  - "*"
+prometheus_monitored_topics:
+  - "!*"
+prometheus_monitored_subscriptions:
+  - "!$SYS*"
+
+# Filters
+prometheus_show_inactive_channels: true
+prometheus_queue_subscription_selector:
+  - PUT
+  - GET
+  - GENERAL
+
+# --- Utility Scripts ConfigMap ---
+# Toggle to include operational scripts (apply-mqsc, depth, showerrors)
+enable_scripts_configmap: true
+
+# Maps survey instance_type value to the QueueManager CR template file
+instance_type_to_template:
+  single: "sgl_qmgr.yaml.j2"
+  nha: "nha_qmgr.yaml.j2"
+  nhacrr: "crr_qmgr.yaml.j2"

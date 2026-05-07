@@ -1,0 +1,26 @@
+---
+# ============================================================
+# Role defaults — qmgr_onboard
+# ============================================================
+# These serve as documentation of expected inputs and provide
+# safe fallbacks. Survey variables override these via extra_vars.
+# ============================================================
+
+# --- Survey Variables (provided by AAP survey or --extra-vars) ---
+# qm_action:        "Create" or "Update"
+# app_sys_id:       Application System ID / SYSID (e.g. "DMQ")
+# mq_environment:   "DEV", "QA1", "QA2", "QA3", or "PROD"
+# total_volume_24h: Expected 24h message volume (e.g. "1m", "500k")
+# avg_msg_size:     Average message size (e.g. "4k", "10m", "100m")
+
+# --- Auto-Derived (NEVER set these in surveys) ---
+# seq_number:       Auto-discovered from Git repo (001, 002, ...)
+# instance_type:    Computed from environment (nha | nhacrr)
+# size:             Computed from volume × msg_size → sizing matrix lookup (includes log_storage)
+# deploy_regions:   Computed from instance_type (use | use+cluster2)
+# namespace:        Computed as <SYSID>-MQ-<3-CHAR-ENV>-<SEQ>
+# qmgr_name:        Computed as <SYSID><2-CHAR-ENV><SEQ>
+# vault_namespace:  Computed from app_sys_id via vault_security_zones
+
+# Maximum sequence number to scan before failing (safety limit)
+qmgr_onboard_seq_max_scan: 999

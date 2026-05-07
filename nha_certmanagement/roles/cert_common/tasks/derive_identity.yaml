@@ -1,0 +1,53 @@
+---
+# =============================================================
+# derive_identity.yaml — Shared Queue Manager Identity Builder
+# =============================================================
+#
+# Used by all certificate roles so qmgr_name, namespace, and
+# path-related variables stay aligned with the onboarding role.
+#
+# Inputs:
+# - app_prefix       : survey / extra_vars
+# - mq_environment   : survey / extra_vars
+# - sequence_number  : survey / extra_vars
+# - env_qmgr_abbr    : nativeha_qmgr_control_vars.yaml
+# - env_namespace_abbr: nativeha_qmgr_control_vars.yaml
+#
+# Outputs:
+# - app_prefix_normalized
+# - env_upper / env_lower / env_code / env_ns_code
+# - qmgr_name / qmgr_name_upper
+# - namespace
+# - _zone / vault_namespace / vault_cert_mount_point
+#
+# =============================================================
+
+- name: "Identity — Normalize prefix and environment inputs"
+  ansible.builtin.set_fact:
+    # app_prefix_normalized is reused in Vault paths and registry keys.
+    app_prefix_normalized: "{{ app_prefix | lower }}"
+    # env_upper is the common key for all environment maps.
+    env_upper: "{{ mq_environment | upper }}"
+    env_lower: "{{ mq_environment | lower }}"
+    # env_code builds qmgr_name; env_ns_code builds namespace.
+    env_code: "{{ env_qmgr_abbr[mq_environment | upper] | lower }}"
+    env_ns_code: "{{ env_namespace_abbr[mq_environment | upper] | lower }}"
+
+- name: "Identity — Derive queue manager and namespace names"
+  ansible.builtin.set_fact:
+    # Example: app_prefix=dmq, env_code=q2, sequence_number=003 -> dmqq2003.
+    qmgr_name: "{{ app_prefix_normalized }}{{ env_code }}{{ sequence_number }}"
+    qmgr_name_upper: "{{ (app_prefix_normalized ~ env_code ~ sequence_number) | upper }}"
+    # Example: dmq-mq-qa2-003.
+    namespace: "{{ app_prefix_normalized }}-mq-{{ env_ns_code }}-{{ sequence_number }}"
+
+- name: "Identity — Derive Vault security zone"
+  ansible.builtin.set_fact:
+    # HRA/SRA is selected from the app list in vault_security_zones.
+    _zone: "{{ 'hra' if app_prefix_normalized in vault_security_zones.hra.apps else 'sra' }}"
+
+- name: "Identity — Derive Vault namespace and mount"
+  ansible.builtin.set_fact:
+    # These values drive both certificate storage and generated VSO manifests.
+    vault_namespace: "{{ vault_security_zones[_zone].label | default('') }}"
+    vault_cert_mount_point: "{{ vault_security_zones[_zone].mount }}"

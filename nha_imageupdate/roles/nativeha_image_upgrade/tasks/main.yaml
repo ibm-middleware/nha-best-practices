@@ -1,0 +1,228 @@
+---
+# =============================================================
+# MQ Upgrade role
+# =============================================================
+#
+# Variable map for readers:
+# - AAP survey provides qmgr_name, mq_environment, new_mq_version,
+#   and optionally new_license_id.
+# - nativeha_qmgr_control_vars.yaml provides env_repo_map,
+#   env_branch_map, env_qmgr_abbr, qmgr_env_subdir_map, regions,
+#   default_deploy_region, mq_image_registry, mq_image_repository,
+#   license_ids, git_work_dir, and git identity.
+# - This role derives env_upper, qmgr_name_normalized,
+#   git_repo_url, target_branch, instance_type, qmgr_rel_path,
+#   _target_regions, _upgrade_version, _upgrade_license_id,
+#   and _upgrade_image.
+# - Before calling target_repo_publish.yaml, this role sets the
+#   target_repo_pr_* facts that describe the action for direct commit
+#   mode and pull-request mode.
+#
+# Important behavior:
+# - Only overlay qm-image-patch.yaml files are allowed to change.
+# - The base qmgr.yaml is intentionally untouched during image upgrade.
+# - git_work_dir is replaced with a unique per-run clone path so
+#   simultaneous AAP jobs do not share the same working copy.
+# =============================================================
+
+- name: "MQ upgrade - Execute with guaranteed workspace cleanup"
+  block:
+    - name: "Pre-flight - Validate upgrade inputs"
+      ansible.builtin.assert:
+        that:
+          - qmgr_name is defined and qmgr_name | length > 0
+          - mq_environment is defined and mq_environment | upper in ['DEV', 'QA1', 'QA2', 'QA3', 'PROD']
+          - new_mq_version is defined and new_mq_version | length > 0
+        fail_msg: >-
+          Required inputs: qmgr_name, mq_environment, new_mq_version.
+
+    - name: "Identity - Normalize input values"
+      ansible.builtin.set_fact:
+        # qmgr_name_normalized is the lowercase directory name in the target repo.
+        qmgr_name_normalized: "{{ qmgr_name | lower }}"
+        # env_upper is the normalized key used for all global variable maps.
+        env_upper: "{{ mq_environment | upper }}"
+
+    - name: "Pre-flight - Validate qmgr_name belongs to environment"
+      ansible.builtin.assert:
+        that:
+          - qmgr_name_normalized is match('^[a-z0-9]{3}' ~ (env_qmgr_abbr[env_upper] | lower) ~ '[0-9]{3}$')
+        fail_msg: >-
+          qmgr_name must follow <3-char-app><{{ env_qmgr_abbr[env_upper] | lower }}><3-digit-seq>
+          for {{ env_upper }}. Got: {{ qmgr_name }}.
+
+    - name: "Identity - Derive target repo and paths"
+      ansible.builtin.set_fact:
+        # git_repo_url/target_branch come from environment maps in global vars.
+        git_repo_url: "{{ env_repo_map[env_upper] }}"
+        target_branch: "{{ env_branch_map[env_upper] }}"
+        # QA2 and PROD use CRR, so image upgrade must update every region.
+        instance_type: "{{ 'nhacrr' if env_upper in ['QA2', 'PROD'] else 'nha' }}"
+        # qmgr_rel_path is the queue manager folder inside the target repo.
+        qmgr_rel_path: >-
+          {{
+            ('queue_managers/' ~ qmgr_env_subdir_map[env_upper])
+            if env_upper in (qmgr_env_subdir_map | default({}))
+            else 'queue_managers'
+          }}/{{ qmgr_name_normalized }}
+
+    - name: "Identity - Compute target regions"
+      ansible.builtin.set_fact:
+        # CRR queue managers have one image patch per configured region.
+        _target_regions: "{{ regions.keys() | list if instance_type == 'nhacrr' else [default_deploy_region | default('cluster1')] }}"
+        # Used later to prove no unexpected files were changed by this playbook.
+        _expected_upgrade_patch_paths: >-
+          {{
+            (regions.keys() | list if instance_type == 'nhacrr' else [default_deploy_region | default('cluster1')])
+            | map('regex_replace', '^(.*)$', qmgr_rel_path ~ '/overlays/\1/qm-image-patch.yaml')
+            | list
+          }}
+
+    - name: "Git - Isolate working directory for this run"
+      ansible.builtin.set_fact:
+        # Preserve configured base path and then create a unique clone folder.
+        git_work_dir_base: "{{ git_work_dir }}"
+        git_work_dir: "{{ git_work_dir }}/mq_upgrade_{{ qmgr_name_normalized }}_{{ now(utc=false, fmt='%Y%m%d%H%M%S') }}_{{ 1000000 | random }}"
+
+    - name: "Upgrade - Derive requested values"
+      ansible.builtin.set_fact:
+        # _upgrade_version is exactly the survey value written to /spec/version.
+        _upgrade_version: "{{ new_mq_version }}"
+        # new_license_id is optional; global license_ids supplies the fallback.
+        _upgrade_license_id: "{{ new_license_id | default((license_ids.PROD if env_upper == 'PROD' else license_ids.NONPROD), true) }}"
+        # _upgrade_image is the full container image written to the image patch.
+        _upgrade_image: "{{ mq_image_registry }}/{{ mq_image_repository }}:{{ new_mq_version }}"
+
+    - name: "Git - Ensure work base exists"
+      ansible.builtin.file:
+        path: "{{ git_work_dir_base }}"
+        state: directory
+        mode: "0755"
+      check_mode: false
+
+    - name: "Git - Clone and configure target repo"
+      ansible.builtin.include_tasks:
+        file: "../../../../nativeha_templates/shared_tasks/git_clone_and_configure.yaml"
+
+    - name: "Pre-flight - Check expected upgrade patch files"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ qmgr_rel_path }}/overlays/{{ item }}/qm-image-patch.yaml"
+      loop: "{{ _target_regions }}"
+      register: _upgrade_patch_stats
+
+    - name: "Pre-flight - Collect missing upgrade patches"
+      ansible.builtin.set_fact:
+        _missing_upgrade_patches: "{{ _upgrade_patch_stats.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+
+    - name: "Pre-flight - Fail if upgrade patches are missing"
+      ansible.builtin.fail:
+        msg: >-
+          Missing qm-image-patch.yaml for {{ qmgr_name_normalized }} regions:
+          {{ _missing_upgrade_patches }}. Ensure the queue manager has been
+          onboarded with the Base + Overlays layout first.
+      when: _missing_upgrade_patches | length > 0
+
+    - name: "Upgrade - Display summary"
+      ansible.builtin.debug:
+        msg:
+          - "MQ upgrade plan"
+          - "Queue Manager : {{ qmgr_name_normalized | upper }}"
+          - "Environment   : {{ env_upper }}"
+          - "Version       : {{ _upgrade_version }}"
+          - "License ID    : {{ _upgrade_license_id }}"
+          - "Image         : {{ _upgrade_image }}"
+          - "Regions       : {{ _target_regions }}"
+
+    - name: "Upgrade - Render qm-image-patch.yaml for each region"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../nativeha_templates/overlays/qm_image_patch.yaml.j2"
+        dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/overlays/{{ item }}/qm-image-patch.yaml"
+        mode: "0644"
+      vars:
+        mq_version: "{{ _upgrade_version }}"
+        license_id: "{{ _upgrade_license_id }}"
+      loop: "{{ _target_regions }}"
+
+    - name: "Git - Check pending upgrade changes"  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: git status --porcelain
+      args:
+        chdir: "{{ git_work_dir }}"
+      register: _upgrade_git_status
+      changed_when: false
+      check_mode: false
+
+    - name: "Git - Classify pending upgrade change paths"
+      ansible.builtin.set_fact:
+        _upgrade_unexpected_paths: >-
+          {{
+            (_upgrade_git_status.stdout_lines
+             | map('regex_replace', '^..\s+', '')
+             | list)
+            | difference(_expected_upgrade_patch_paths)
+          }}
+
+    - name: "Git - Fail if image upgrade changed unexpected files"
+      ansible.builtin.assert:
+        that:
+          - _upgrade_unexpected_paths | length == 0
+        fail_msg: >-
+          Image upgrade changed unexpected files: {{ _upgrade_unexpected_paths }}.
+          Expected only: {{ _expected_upgrade_patch_paths }}.
+
+    - name: "Git - Prepare target repo publish metadata"
+      ansible.builtin.set_fact:
+        target_repo_pr_action_slug: "image-upgrade"
+        target_repo_pr_action_label: "Image Upgrade"
+        target_repo_pr_repo_path: "{{ qmgr_rel_path }}"
+        target_repo_pr_summary: >-
+          Upgrade {{ qmgr_name_normalized | upper }} in {{ env_upper }} to MQ
+          version {{ _upgrade_version }} using image {{ _upgrade_image }} and
+          license ID {{ _upgrade_license_id }}.
+        target_repo_pr_validation: >-
+          Verified required qm-image-patch.yaml files exist for regions
+          {{ _target_regions | join(', ') }} and rendered updated image patches.
+
+    - name: "Git - Publish target repo changes"
+      ansible.builtin.include_tasks: "../../../../nativeha_templates/shared_tasks/target_repo_publish.yaml"
+
+    - name: "Upgrade - No changes required"
+      ansible.builtin.debug:
+        msg: "No upgrade changes were required for {{ qmgr_name_normalized | upper }}."
+      when:
+        - not ansible_check_mode
+        - not target_repo_pr_result.changed | bool
+
+    - name: "Upgrade - Complete"
+      ansible.builtin.debug:
+        msg:
+          - "Upgrade complete"
+          - "Queue Manager : {{ qmgr_name_normalized | upper }}"
+          - "Version       : {{ _upgrade_version }}"
+          - "Base Branch   : {{ target_branch }}"
+          - "Change Mode   : {{ target_repo_pr_result.mode | default(target_repo_change_mode | default('pull_request')) }}"
+          - "Publish Branch: {{ target_repo_pr_result.branch | default('not created') }}"
+          - "PR URL        : {{ target_repo_pr_result.pull_request_url | default('not created') }}"
+
+  rescue:
+    - name: "Rescue - Log upgrade failure"
+      ansible.builtin.debug:
+        msg:
+          - "MQ upgrade failed"
+          - "Queue Manager : {{ qmgr_name | default('not supplied') | upper }}"
+          - "Environment   : {{ mq_environment | default('not supplied') | upper }}"
+
+    - name: "Rescue - Re-raise upgrade failure"
+      ansible.builtin.fail:
+        msg: "MQ upgrade failed. Review the task output above."
+
+  always:
+    - name: "Always - Remove git working directory"
+      ansible.builtin.file:
+        path: "{{ git_work_dir }}"
+        state: absent
+      when:
+        - git_work_dir is defined
+        - git_work_dir_base is defined
+        - git_work_dir != git_work_dir_base
+      check_mode: false

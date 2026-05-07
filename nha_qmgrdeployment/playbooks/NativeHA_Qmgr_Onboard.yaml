@@ -1,0 +1,48 @@
+---
+# ============================================================
+# Onboard MQ Queue Manager — NativeHA Automation
+# ============================================================
+# This playbook is designed for Ansible Automation Platform.
+# Survey variables are passed as extra_vars.
+#
+# Survey variables:
+#   Create:
+#     qm_action:        Create
+#     app_sys_id:       Application System ID / prefix (e.g. DMQ)
+#     mq_environment:   DEV | QA1 | QA2 | QA3 | PROD
+#     total_volume_24h: Expected 24h message volume (e.g. 1m, 500k, 1k)
+#     avg_msg_size:     Average message size (e.g. 4k, 10m, 100m)
+#   Update:
+#     qm_action:        Update
+#     mq_environment:   DEV | QA1 | QA2 | QA3 | PROD
+#     qmgr_name:        Full Queue Manager Name (e.g. DMQDV001)
+#     total_volume_24h: Expected 24h message volume (e.g. 1m, 500k, 1k)
+#     avg_msg_size:     Average message size (e.g. 4k, 10m, 100m)
+#
+# Auto-derived (NEVER add as survey variables):
+#   seq_number        - auto-discovered from Git repo (001, 002, ...)
+#   instance_type     - nha (DEV/QA1/QA3) or nhacrr (QA2/PROD)
+#   selected_size_tier - best-match from sizing matrix
+#   qmgr_size         - CPU, memory, storage, and log sizing selected by tier
+#   _target_regions   - use (single) or all configured regions (CRR)
+#   namespace         - <sysid>-mq-<3-char-env>-<seq>
+#   qmgr_name         - <sysid><2-char-env><seq>
+#   vault_namespace   - derived from app_sys_id via vault_security_zones
+#
+# Variables loaded from nativeha_qmgr_control_vars.yaml:
+#   env_repo_map/env_branch_map - target Git repo and base branch
+#   env_qmgr_abbr/env_namespace_abbr - naming abbreviations
+#   sizing/sizing_order - storage-to-tier mapping
+#   regions/default_deploy_region - overlay and ArgoCD app targets
+#   vault_security_zones - Vault namespace/mount/VSO values
+#   target_repo_change_mode - direct commit or pull_request publication
+# ============================================================
+- name: Onboard MQ Queue Manager
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  roles:
+    - role: qmgr_onboard
