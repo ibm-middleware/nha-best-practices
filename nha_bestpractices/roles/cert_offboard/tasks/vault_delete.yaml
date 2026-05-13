@@ -1,0 +1,82 @@
+---
+# Purpose: Delete selected certificate data from samplecertrepo.
+- name: "Step 5 - Delete from samplecertrepo"
+  community.hashi_samplecertrepo.samplecertrepo_kv2_delete:
+    url: "{{ samplecertrepo_url }}"
+    auth_method: "{{ samplecertrepo_cert_auth_method }}"
+    token: "{{ samplecertrepo_cert_token if samplecertrepo_cert_auth_method == 'token' else omit }}"
+    role_id: "{{ samplecertrepo_cert_role_id if samplecertrepo_cert_auth_method == 'approle' else omit }}"
+    secret_id: "{{ samplecertrepo_cert_secret_id if samplecertrepo_cert_auth_method == 'approle' else omit }}"
+    validate_certs: "{{ samplecertrepo_validate_certs | default(true) }}"
+    engine_mount_point: "{{ samplecertrepo_cert_mount_point }}"
+    namespace: "{{ samplecertrepo_namespace if (samplecertrepo_namespace | default('') | length > 0) else omit }}"
+    path: "{{ samplecertrepo_cert_base_path }}/{{ cert_type_samplecertrepo_subpath[item] }}"
+    timeout: "{{ nativeha_api_timeout | default(45) | int }}"
+  loop: "{{ active_cert_types }}"
+  loop_control:
+    label: "{{ item }}"
+  register: _samplecertrepo_delete_results
+  failed_when: false
+  no_log: true
+
+# Purpose: Start clean tracking data for this part of the workflow.
+- name: "Step 5 - Initialize samplecertrepo delete failures"
+  ansible.builtin.set_fact:
+    _samplecertrepo_delete_failures: []
+
+# Purpose: Convert failed module results into safe, readable failure messages.
+- name: "Step 5 - Collect samplecertrepo delete failures"
+  ansible.builtin.set_fact:
+    _samplecertrepo_delete_failures: >-
+      {{
+        _samplecertrepo_delete_failures + [
+          {
+            'cert_type': item.item | default('unknown'),
+            'path': samplecertrepo_cert_base_path ~ '/' ~ cert_type_samplecertrepo_subpath[item.item | default('app')],
+            'detail': (
+              item.msg
+              | default(item.errors | default('samplecertrepo delete failed without a module message.', true), true)
+              | string
+              | regex_replace('\n+', ' ')
+              | regex_replace('\s+', ' ')
+              | regex_replace('(?i)(token|password|secret_id|secret-id)[:=][^\s,;}]+', '\1=[redacted]')
+              | trim
+            )
+          }
+        ]
+      }}
+  loop: "{{ _samplecertrepo_delete_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when: >-
+    item.failed | default(false) | bool
+    or item.status | default(0) | int >= 400
+    or item.exception is defined
+    or (
+      item.msg is defined
+      and item.msg | string | trim is search('(?i)(failed|forbidden|permission|unauthorized|invalid|denied|cannot|unable|error)')
+    )
+  no_log: true
+
+# Purpose: Stop when samplecertrepo delete failed.
+- name: "Step 5 - Fail if samplecertrepo delete failed"
+  ansible.builtin.fail:
+    msg: |-
+      samplecertrepo certificate deletion failed for {{ qmgr_name | upper }}.
+
+      samplecertrepo URL: {{ samplecertrepo_url }}
+      KV mount: {{ samplecertrepo_cert_mount_point }}
+
+      Failed path(s):
+      {% for failure in _samplecertrepo_delete_failures %}
+      - {{ failure.cert_type }}: {{ failure.path }}
+        Detail: {{ failure.detail }}
+      {% endfor %}
+
+      Certificate offboarding stopped before the registry was updated. Please verify samplecertrepo access and rerun.
+  when: _samplecertrepo_delete_failures | length > 0
+
+# Purpose: Record that samplecertrepo delete finished for this certificate type.
+- name: Step 5 - samplecertrepo purge complete
+  ansible.builtin.debug:
+    msg: "Deleted {{ active_cert_types | length }} path(s) under {{ samplecertrepo_cert_base_path }}/"

@@ -1,0 +1,14 @@
+---
+# MQ NativeHA certificate onboarding/renewal.
+
+# Purpose: Turn the requested queue manager scope into an exact target list.
+- name: "Cert onboard - Resolve queue manager targets"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/resolve_targets.yaml"
+
+# Purpose: Run certificate onboarding for each resolved queue manager target.
+- name: "Cert onboard - Process resolved targets"
+  ansible.builtin.include_tasks: process_target.yaml
+  loop: "{{ cert_targets }}"
+  loop_control:
+    loop_var: cert_target
+    label: "{{ cert_target.qmgr_name }}"

@@ -1,0 +1,58 @@
+---
+# Purpose: Read certificate details needed for lifecycle decisions and reporting.
+- name: "Diagnostics - Query samplecertca certificate {{ cert_type }}"
+  ansible.builtin.uri:
+    url: >-
+      {{ samplecertca_url }}{{ samplecertca_cert_search }}?ObjectDN={{
+        (samplecertca_policy_dn ~ '\\' ~ qmgr_name ~ '_' ~ cert_type_csr_suffix[cert_type])
+        | urlencode }}
+    method: GET
+    headers:
+      accept: "application/json"
+      Authorization: "Bearer {{ samplecertca_token }}"
+    validate_certs: "{{ samplecertca_validate_certs }}"
+    status_code: [200, 400, 404]
+  register: _samplecertca_status
+  failed_when: false
+  no_log: true
+
+# Purpose: Store live provider status for {{ cert_type }} diagnostics.
+- name: "Diagnostics - samplecertca certificate status {{ cert_type }}"
+  ansible.builtin.debug:
+    msg:
+      - "Cert Type : {{ cert_type }}"
+      - "DN        : {{ samplecertca_policy_dn }}\\{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}"
+      - "HTTP      : {{ _samplecertca_status.status | default('unknown') }}"
+      - "Found     : {{ (_samplecertca_status.json.Certificates | default([]) | length) > 0 if _samplecertca_status.json is defined else false }}"
+
+# Purpose: Store samplecertca status diagnostics for the final report.
+- name: "Diagnostics - Record samplecertca certificate status {{ cert_type }}"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'qmgr_name': qmgr_name,
+            'namespace': namespace,
+            'target': qmgr_name | upper,
+            'check': 'samplecertca status: ' ~ cert_type,
+            'status': (
+              'passed'
+              if (
+                _samplecertca_status.status | default(0) | int == 200
+                and _samplecertca_status.json is defined
+                and (_samplecertca_status.json.Certificates | default([]) | length) > 0
+              )
+              else 'attention'
+            ),
+            'detail': (
+              'HTTP ' ~ (_samplecertca_status.status | default('unknown') | string)
+              ~ '; found='
+              ~ (((_samplecertca_status.json.Certificates | default([]) | length) > 0)
+                 if _samplecertca_status.json is defined else false) | string
+            )
+          }
+        ]
+      }}

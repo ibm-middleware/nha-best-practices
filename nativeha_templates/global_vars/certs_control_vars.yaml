@@ -1,42 +1,20 @@
 ---
-# ============================================================
-# MQ NativeHA — Certificate Lifecycle Configuration
-# ============================================================
-# Dedicated control file for DummyCertManager ↔ Vault certificate
-# provisioning and revocation.
-#
+# MQ NativeHA - Certificate Lifecycle Configuration
+# Dedicated control file for samplecertca-backed certificate lifecycle operations.
 # This file is loaded together with nativeha_qmgr_control_vars.yaml.
-# Certificate-specific values live here; shared naming, regions,
-# Vault zones, and vault_url come from nativeha_qmgr_control_vars.yaml.
-#
-# Loaded by: NativeHA_Cert_Management.yaml
-# ============================================================
+# Certificate-specific values live here. Shared naming, OpenShift topology,
+# delivery backend, samplecertrepo zones, and samplecertrepo_url come from
+# nativeha_qmgr_control_vars.yaml.
+# Loaded by: NativeHA_Cert_Onboard/Renew/Monitor/Offboard/Diagnostics.yaml
 
-# ────────────────────────────────────────────────────
-# Shared Constants — sourced from qmgr_control_vars
-# ────────────────────────────────────────────────────
-# vault_url: loaded from nativeha_qmgr_control_vars.yaml (single source of truth).
-# cluster_domains: derived at runtime from the regions map in qmgr_control_vars
-#   so cert SANs and QM routes can never go out of sync.
-#   Override: {{ regions.values() | map(attribute='cluster_domain') | list }}
-# ============================================================
+# Shared Constants - sourced from qmgr_control_vars
+# samplecertrepo_url, mq_cert_delivery_backend, openshift_clusters, env_region_map, and
+# samplecertrepo_security_zones are loaded from nativeha_qmgr_control_vars.yaml.
+# cluster_domains is derived per queue manager target at runtime from
+# openshift_clusters[ENV][region].cluster_domain.
 
-# ────────────────────────────────────────────────────
-# Cluster Domains — Derived from regions map
-# ────────────────────────────────────────────────────
-# This Jinja2 expression reads the 'regions' dict from
-# nativeha_qmgr_control_vars.yaml and extracts the cluster_domain
-# from each region entry. Both cert and QM playbooks share the
-# same source of truth.
-cluster_domains: "{{ regions.values() | map(attribute='cluster_domain') | list }}"
-
-# ────────────────────────────────────────────────────
-# Multi-Cert Profile: Instance Type → Cert Types
-# ────────────────────────────────────────────────────
+# Multi-Cert Profile: Instance Type -> Cert Types
 # Defines which certificates to generate based on instance_type.
-#   single → 1 cert  (app)
-#   nha    → 2 certs (app + nha)
-#   nhacrr → 3 certs (app + nha + nhacrr)
 instance_cert_map:
   single:
     - app
@@ -55,11 +33,10 @@ cert_type_csr_suffix:
   nha: "nha"
   nhacrr: "nhacrr"
 
-# Vault sub-path per cert type (maps exactly to VSO templates)
-# Full Vault path:
-#   {app_prefix}/ibm-mq/{ENV}/{NAMESPACE}/{QMGR_NAME}/{subpath}
-# Must match what VSO VaultStaticSecrets read from.
-cert_type_vault_subpath:
+# samplecertrepo sub-path per cert type (maps exactly to VSO templates)
+# Full samplecertrepo path:
+# Must match what VSO samplecertrepoStaticSecrets read from.
+cert_type_samplecertrepo_subpath:
   app: "app-pki"
   nha: "nha-tls"
   nhacrr: "nhacrr-tls"
@@ -68,139 +45,174 @@ cert_type_vault_subpath:
 # We keep only custom SAN input here to avoid duplicating operator conventions
 # as configurable variables.
 
-# Extra SANs — appended to ALL cert types (leave empty for none)
+# Extra SANs - appended to ALL cert types (leave empty for none)
 qmgr_extra_sans: []
 
-# ────────────────────────────────────────────────────
-# DummyCertManager Connection & Authentication
-# ────────────────────────────────────────────────────
-dummycertmanager_url: "https://mypki.example.lab"
-dummycertmanager_oauth: "/VEDAuth/Authorize/oauth"
-dummycertmanager_revoke: "/vedsdk/certificates/Revoke"
-dummycertmanager_cert_search: "/vedsdk/certificates"
-dummycertmanager_token_revoke: "/VEDAuth/Revoke/token"
+# Extra SANs by certificate type. Prefer this for client-only custom DNS names
+# so NHA and CRR internal certs do not receive unrelated app route SANs.
+qmgr_extra_sans_by_type:
+  app: []
+  nha: []
+  nhacrr: []
 
-dummycertmanager_username: >-
+# samplecertca Connection & Authentication
+samplecertca_url: "{{ lookup('ansible.builtin.env', 'samplecertca_URL', default='https://mypki.example.lab') }}"
+samplecertca_oauth: "/VEDAuth/Authorize/oauth"
+samplecertca_cert_request: "/vedsdk/certificates/Request"
+samplecertca_cert_renew: "/vedsdk/certificates/Renew"
+samplecertca_revoke: "/vedsdk/certificates/Revoke"
+samplecertca_cert_search: "/vedsdk/certificates"
+samplecertca_cert_retrieve: "/vedsdk/certificates/Retrieve"
+samplecertca_token_revoke: "/VEDAuth/Revoke/token"
+
+samplecertca_username: >-
   {{
     lookup('ansible.builtin.env', 'ANSIBLE_NET_USERNAME')
-    | default(lookup('ansible.builtin.env', 'DUMMYCERTMANAGER_USERNAME'), true)
+    | default(lookup('ansible.builtin.env', 'samplecertca_USERNAME'), true)
   }}
-dummycertmanager_password: >-  # pragma: allowlist secret
+samplecertca_password: >-
   {{
     lookup('ansible.builtin.env', 'ANSIBLE_NET_PASSWORD')
-    | default(lookup('ansible.builtin.env', 'DUMMYCERTMANAGER_PASSWORD'), true)
+    | default(lookup('ansible.builtin.env', 'samplecertca_PASSWORD'), true)
   }}
-dummycertmanager_client_id: "MQAutomation"
-dummycertmanager_scope: "certificate:approve,delete,discover,manage,revoke;configuration:manage"
-dummycertmanager_policy_dn: "\\VED\\Policy\\Certificates\\APP1 Automated Certificates"
-dummycertmanager_validate_certs: true
+samplecertca_client_id: "{{ lookup('ansible.builtin.env', 'samplecertca_CLIENT_ID', default='MQAutomation') }}"
+samplecertca_scope: "{{ lookup('ansible.builtin.env', 'samplecertca_SCOPE', default='certificate:approve,delete,discover,manage,revoke;configuration:manage') }}"
+samplecertca_policy_dn: "{{ lookup('ansible.builtin.env', 'samplecertca_POLICY_DN', default='\\VED\\Policy\\Certificates\\DMQ Automated Certificates') }}"
+samplecertca_validate_certs: "{{ lookup('ansible.builtin.env', 'samplecertca_VALIDATE_CERTS', default='true') | bool }}"
 
-# ────────────────────────────────────────────────────
 # Certificate Key & CSR Configuration
-# ────────────────────────────────────────────────────
 cert_key_size: 4096
 cert_key_type: "RSA"
 
-cert_common_name: "{{ qmgr_name }}.example.lab"
-cert_country_name: "US"
-cert_state_or_province: "NY"
-cert_locality_name: "New York"
-cert_organization_name: "Example Lab"
-cert_organizational_unit: "IT"
+cert_common_name_domain: >-
+  {{
+    lookup(
+      'ansible.builtin.env',
+      'NATIVEHA_CERT_COMMON_NAME_DOMAIN',
+      default=custom_client_dns_domain | default('example.lab')
+    )
+  }}
+cert_common_name: "{{ qmgr_name }}.{{ cert_common_name_domain }}"
+cert_country_name: "{{ lookup('ansible.builtin.env', 'NATIVEHA_CERT_COUNTRY', default='US') }}"
+cert_state_or_province: "{{ lookup('ansible.builtin.env', 'NATIVEHA_CERT_STATE', default='NY') }}"
+cert_locality_name: "{{ lookup('ansible.builtin.env', 'NATIVEHA_CERT_LOCALITY', default='New York') }}"
+cert_organization_name: "{{ lookup('ansible.builtin.env', 'NATIVEHA_CERT_ORGANIZATION', default='example.lab Lab') }}"
+cert_organizational_unit: "{{ lookup('ansible.builtin.env', 'NATIVEHA_CERT_ORG_UNIT', default='IT') }}"
 
-# ────────────────────────────────────────────────────
 # Pre-Request Validation & Renewal Threshold
-# ────────────────────────────────────────────────────
-# Before requesting a new cert from DummyCertManager, the automation
-# checks Vault and DummyCertManager for existing valid certs.
+# Before requesting a new cert from samplecertca, the automation
+# checks samplecertrepo and samplecertca for existing valid certs.
 # If a cert exists and has MORE than this many days until
 # expiry, it is SKIPPED (no new request).
 # If it has FEWER days remaining, it is RENEWED.
 cert_renewal_threshold_days: 30
 
-# ────────────────────────────────────────────────────
-# DummyCertManager Polling Configuration
-# ────────────────────────────────────────────────────
-dummycertmanager_poll_retries: 30
-dummycertmanager_poll_delay: 20
+# Certificate registry is SRE-facing operational metadata. Keep it enabled by
+# default, but isolate it on the dedicated state-only branch below so registry
+# updates do not create PR noise against app/GitOps branches. Set
+# NATIVEHA_CERT_REGISTRY_ENABLED=false only for one-off lab runs that should not
+# publish registry metadata.
+cert_registry_enabled: "{{ lookup('ansible.builtin.env', 'NATIVEHA_CERT_REGISTRY_ENABLED', default='true') | bool }}"
 
-# ────────────────────────────────────────────────────
-# DummyCertManager Revocation Settings (Offboard)
-# ────────────────────────────────────────────────────
-dummycertmanager_revoke_reason: 0
-dummycertmanager_revoke_disable: true
-dummycertmanager_revoke_comments: "Decommissioned via Ansible AAP NativeHA Offboard — {{ qmgr_name }}"
+# Monitor source default lives in cert_monitor/defaults/main.yaml.
+# Do not duplicate it here; the role default is authoritative.
 
-# ────────────────────────────────────────────────────
-# Vault KV Configuration
-# ────────────────────────────────────────────────────
-# Skips Vault interactions for testing DummyCertManager in isolation
-# WARNING: Set to true ONLY for isolated DummyCertManager testing.
-#          PROD must always use Vault (false).
-skip_vault_operations: false
+# OpenShift Secret backend settings.
+cert_openshift_secret_type: "kubernetes.io/tls"
 
-# Vault KV token — accepts an explicit Ansible var or runtime env injection.
-# Supported sources, in order:
-#   1. vault_token / hashi_vault_token Ansible vars (for AAP credential injectors)
-#   2. VAULT_TOKEN env var
-#   3. vault_token env var
-# This keeps local CLI runs and AAP launches aligned even when the controller
-# injects a variable instead of a literal VAULT_TOKEN environment variable.
-vault_cert_token: >-  # pragma: allowlist secret
+# samplecertca Polling Configuration
+samplecertca_poll_retries: 30
+samplecertca_poll_delay: 20
+
+# samplecertca Revocation Settings (Offboard)
+samplecertca_revoke_reason: 0
+samplecertca_revoke_disable: true
+samplecertca_revoke_comments: "Decommissioned via Ansible AAP NativeHA Offboard - {{ qmgr_name }}"
+
+# samplecertrepo KV Configuration
+# samplecertrepo auth - token for current testing, AppRole ready for the later service
+# account / automation credential model.
+samplecertrepo_cert_auth_method: >-
   {{
-    vault_token
-    | default(hashi_vault_token, true)
-    | default(lookup('ansible.builtin.env', 'VAULT_TOKEN', default=''), true)
-    | default(lookup('ansible.builtin.env', 'vault_token', default=''), true)
+    samplecertrepo_auth_method
+    | default(lookup('ansible.builtin.env', 'samplecertrepo_AUTH_METHOD', default='token'), true)
   }}
-# Runtime-derived from nativeha_qmgr_control_vars.yaml → vault_security_zones
-# so cert lifecycle and VSO always use the same Vault mount and, when enabled,
-# the same Vault Enterprise namespace.
-vault_cert_mount_point: ""
-# Shared path helpers so cert lifecycle and generated VSO manifests
-# point at the exact same Vault location.
-vault_path_prefix: "{{ app_prefix_normalized | default(app_prefix | lower) }}"
-vault_cert_namespace_path: "{{ namespace | lower }}"
-vault_cert_qmgr_path: "{{ qmgr_name_upper | default(qmgr_name | upper) }}"
+samplecertrepo_validate_certs: "{{ not (lookup('ansible.builtin.env', 'samplecertrepo_SKIP_VERIFY', default='false') | bool) }}"
 
-# Full Vault KV path:
-#   {mount}/data/{vault_path_prefix}/ibm-mq/{ENV}/{namespace-lower}/{QMGR_NAME}/{cert-type}
-# Aligns with nativeha_templates/base/secrets/*.yaml
-vault_cert_base_path: "{{ vault_path_prefix }}/ibm-mq/{{ mq_environment | upper }}/{{ vault_cert_namespace_path }}/{{ vault_cert_qmgr_path }}"
+# samplecertrepo KV token - accepts an explicit Ansible var or runtime env injection.
+# Supported sources, in order:
+# This keeps local CLI runs and AAP launches aligned even when the controller
+# injects a variable instead of a literal samplecertrepo_TOKEN environment variable.
+samplecertrepo_cert_token: >-
+  {{
+    samplecertrepo_token
+    | default(hashi_samplecertrepo_token, true)
+    | default(lookup('ansible.builtin.env', 'samplecertrepo_TOKEN', default=''), true)
+    | default(lookup('ansible.builtin.env', 'samplecertrepo_token', default=''), true)
+  }}
+samplecertrepo_cert_role_id: >-
+  {{
+    samplecertrepo_role_id
+    | default(lookup('ansible.builtin.env', 'samplecertrepo_ROLE_ID', default=''), true)
+  }}
+samplecertrepo_cert_secret_id: >-
+  {{
+    samplecertrepo_secret_id
+    | default(lookup('ansible.builtin.env', 'samplecertrepo_SECRET_ID', default=''), true)
+  }}
 
-# ────────────────────────────────────────────────────
 # Git Configuration (for Certificate Registry)
-# ────────────────────────────────────────────────────
-# The cert registry (cert_inventory.yaml) is committed to the
-# repo after every cert action (onboard/offboard/renew/monitor).
+# The cert registry (cert_inventory.yaml) is optional metadata. It is committed
+# only when NATIVEHA_CERT_REGISTRY_ENABLED=true.
 # Certificate registry repository settings are kept here because the registry
-# is owned by the certificate lifecycle, even though shared naming and Vault
+# is owned by the certificate lifecycle, even though shared naming and samplecertrepo
 # settings come from nativeha_qmgr_control_vars.yaml.
-cert_git_base_url: "git@bitbucket.org:example/mq-native-ha-v1.git"
-cert_git_branch: "main"
+# Registry should live on a dedicated orphan state branch that contains only
+# nativeha_state/cert_registry/cert_inventory.yaml. Keep this separate from
+# main/master, AAP project branches, and GitOps promotion branches to avoid PR
+# noise.
+# Do not use CERT_GIT_BRANCH for registry state. That name is too generic and
+# is often used by AAP/project setup to mean the playbook source branch.
+# Use CERT_REGISTRY_GIT_BRANCH only when the state-only branch name must differ
+# from the default below.
+cert_git_base_url: >-
+  {{
+    lookup('ansible.builtin.env', 'CERT_GIT_BASE_URL', default='git@git.example.lab:example.lab/mq-native-ha-v1.git')
+  }}
+cert_registry_git_branch: >-
+  {{
+    lookup(
+      'ansible.builtin.env',
+      'CERT_REGISTRY_GIT_BRANCH',
+      default=lookup('ansible.builtin.env', 'NATIVEHA_CERT_REGISTRY_BRANCH', default='state/cert-registry')
+    )
+  }}
+# NOTE: cert_git_branch alias removed — use cert_registry_git_branch directly.
+# The alias had zero consumers and created confusion with the registry branch.
 cert_git_work_dir: "/tmp/mq-cert-registry"
-cert_git_user_name: "MQ Cert Automation"
-cert_git_user_email: "mq-cert-automation@example.lab"
+cert_git_user_name: "{{ lookup('ansible.builtin.env', 'NATIVEHA_CERT_GIT_USER_NAME', default='MQ Cert Automation') }}"
+cert_git_user_email: "{{ lookup('ansible.builtin.env', 'NATIVEHA_CERT_GIT_USER_EMAIL', default='mq-cert-automation@example.lab') }}"
 
-# ────────────────────────────────────────────────────
 # Certificate Registry
-# ────────────────────────────────────────────────────
 # Path (relative to repo root) to the auto-managed inventory file.
-# Updated by every cert action; read by monitor for "all" scope.
-cert_registry_path: "nativeha_templates/cert_registry/cert_inventory.yaml"
+# Updated only when cert_registry_enabled=true; read by monitor for "all" scope.
+cert_registry_path: "nativeha_state/cert_registry/cert_inventory.yaml"
 
-# ────────────────────────────────────────────────────
 # SMTP Alerting Configuration
-# ────────────────────────────────────────────────────
-# Enable SMTP alerts for certificate health issues
-smtp_enabled: true
-smtp_host: "smtp.example.lab"
-smtp_port: 25
-smtp_from: "mq-cert-automation@example.lab"
-smtp_to:
-  - "mq-support@example.lab"
-  - "middleware-ops@example.lab"
+# Enable SMTP alerts for certificate health issues. These defaults mirror the
+# lab OpenShift Alertmanager Gmail relay, while keeping the password in
+# runtime credential injection only.
+smtp_enabled: "{{ notification_email_enabled | default(lookup('ansible.builtin.env', 'NATIVEHA_EMAIL_ENABLED', default='true') | bool) }}"
+smtp_host: "{{ notification_email_host | default(lookup('ansible.builtin.env', 'NATIVEHA_SMTP_HOST', default='smtp.example.lab')) }}"
+smtp_port: "{{ notification_email_port | default(lookup('ansible.builtin.env', 'NATIVEHA_SMTP_PORT', default='587') | int) }}"
+smtp_secure: "{{ notification_email_secure | default(lookup('ansible.builtin.env', 'NATIVEHA_SMTP_SECURE', default='starttls')) }}"
+smtp_from: "{{ notification_email_from | default(lookup('ansible.builtin.env', 'NATIVEHA_SMTP_FROM', default='example.lab.mail@example.lab')) }}"
+smtp_username: "{{ notification_email_username | default(lookup('ansible.builtin.env', 'NATIVEHA_SMTP_USERNAME', default='example.lab.mail@example.lab')) }}"
+smtp_password: "{{ notification_email_password | default(lookup('ansible.builtin.env', 'NATIVEHA_SMTP_PASSWORD', default=''), true) }}"
+smtp_to: "{{ notification_email_to | default([lookup('ansible.builtin.env', 'NATIVEHA_SMTP_TO', default='admin@example.lab')]) }}"
 smtp_subject_prefix: "[MQ Certificate Alert]"
+smtp_timeout: "{{ notification_email_timeout | default(20) }}"
+smtp_no_log: true
 
 # Alert thresholds - send alerts for these statuses
 alert_on_statuses:
@@ -208,4 +220,5 @@ alert_on_statuses:
   - "expired"
   - "missing"
   - "corrupt"
+  - "revoked"
   - "desync"

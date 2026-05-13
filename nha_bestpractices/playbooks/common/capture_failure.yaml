@@ -1,0 +1,97 @@
+---
+# Normalize Ansible rescue failure output into one readable message for console,
+# email, and the final re-raised failure.
+# Enhanced to extract additional safe detail fields (exception, module_stderr,
+# provider JSON error bodies) and redact Bearer tokens, API keys, passwords,
+# and PEM blocks from all captured messages.
+
+# Purpose: Start a clean list for readable failure messages.
+- name: "Failure capture - Initialize details"
+  ansible.builtin.set_fact:
+    _nativeha_failure_messages: []
+    _nativeha_failure_generic_messages:
+      - "One or more items failed"
+      - "All items completed"
+
+# Purpose: Keep useful messages from failed loop items and ignore generic Ansible text.
+- name: "Failure capture - Add failed loop item messages"
+  ansible.builtin.set_fact:
+    _nativeha_failure_messages: >-
+      {{
+        _nativeha_failure_messages
+        + [item.msg | string | trim]
+      }}
+  loop: "{{ ansible_failed_result.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default(item.ansible_loop_var | default('failed item')) }}"
+  when:
+    - item.failed | default(false) | bool
+    - item.msg is defined
+    - item.msg | string | trim | length > 0
+    - item.msg | string | trim not in _nativeha_failure_generic_messages
+
+# Purpose: Keep stderr from failed loop items when no better message exists.
+- name: "Failure capture - Add failed loop stderr"
+  ansible.builtin.set_fact:
+    _nativeha_failure_messages: >-
+      {{
+        _nativeha_failure_messages
+        + [item.stderr | string | trim]
+      }}
+  loop: "{{ ansible_failed_result.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default(item.ansible_loop_var | default('failed item')) }}"
+  when:
+    - item.failed | default(false) | bool
+    - item.msg is not defined
+    - item.stderr is defined
+    - item.stderr | string | trim | length > 0
+
+# Purpose: Collect all safe detail candidates from the failed task result,
+- name: "Failure capture - Add safe task detail candidates"
+  ansible.builtin.set_fact:
+    _nativeha_failure_messages: >-
+      {{
+        _nativeha_failure_messages
+        + (
+          [
+            ansible_failed_result.msg | default('', true),
+            ansible_failed_result.stderr | default('', true),
+            ansible_failed_result.module_stderr | default('', true),
+            ansible_failed_result.exception | default('', true),
+            ansible_failed_result.json.message | default('', true),
+            ansible_failed_result.json.error | default('', true)
+          ]
+          | map('string')
+          | map('trim')
+          | reject('equalto', '')
+          | reject('in', _nativeha_failure_generic_messages)
+          | list
+        )
+      }}
+  when: _nativeha_failure_messages | length == 0
+
+# Purpose: Preserve the raw Ansible failure when no readable detail is available.
+- name: "Failure capture - Add fallback detail"
+  ansible.builtin.set_fact:
+    _nativeha_failure_messages:
+      - "{{ ansible_failed_result | to_nice_json }}"
+  when: _nativeha_failure_messages | length == 0
+
+# Purpose: Store one clean failure string for the final report and re-raised error,
+#          with credential material redacted for safe logging.
+- name: "Failure capture - Finalize playbook error"
+  ansible.builtin.set_fact:
+    nativeha_playbook_status: "failed"
+    nativeha_failed_task_name: "{{ ansible_failed_task.name | default('unknown task') }}"
+    nativeha_playbook_error: >-
+      {{
+        _nativeha_failure_messages
+        | map('regex_replace', '\n{3,}', '\n\n')
+        | map('regex_replace', '(?i)bearer\s+[^\s,;}]+', 'Bearer [redacted]')
+        | map('regex_replace', '(?i)(token|password|secret_id|api[_-]?key)[:=][^\s,;}]+', '\1=[redacted]')
+        | map('regex_replace', '-----BEGIN [^-]+-----.*-----END [^-]+-----', '[redacted PEM]')
+        | unique
+        | join('\n\n')
+        | trim
+      }}

@@ -1,0 +1,510 @@
+---
+# MQ Upgrade role
+# Variable map for readers:
+# - AAP survey provides app_sys_id, mq_environment, qmgr_name,
+# - qmgr_name is a selector:
+# - nativeha_qmgr_control_vars.yaml provides env_repo_map,
+# - This role derives env_upper, app_prefix, env_code, qmgr_root_rel,
+# - Before calling target_repo_publish.yaml, this role sets the
+# Important behavior:
+# - Queue manager discovery is Git-only. The playbook never queries OpenShift.
+# - Only overlays/_shared/patches/qm-image-patch.yaml is allowed to change.
+# - The base qmgr.yaml is intentionally untouched during image upgrade.
+# - git_work_dir is replaced with a unique per-run clone path so
+
+# Purpose: Group the work so failures are reported and the temporary Git workspace is removed.
+- name: "MQ upgrade - Execute with guaranteed workspace cleanup"
+  block:
+    # Purpose: Check operator inputs before starting image upgrade changes.
+    - name: "Pre-flight - Validate upgrade inputs"
+      ansible.builtin.assert:
+        that:
+          - app_sys_id | default('', true) | trim | length > 0
+          - mq_environment | default('', true) | trim | length > 0
+          - qmgr_name | default('', true) | trim | length > 0
+          - new_mq_version | default('', true) | trim | length > 0
+        fail_msg: >-
+          Required inputs: app_sys_id, mq_environment, qmgr_name,
+          new_mq_version. qmgr_name may be a single queue manager, a
+          comma-separated list, or all.
+
+    # Purpose: Trim and standardize operator input before validation.
+    - name: "Identity - Normalize input values"
+      ansible.builtin.set_fact:
+        app_prefix: "{{ app_sys_id | lower | trim }}"
+        env_upper: "{{ mq_environment | upper | trim }}"
+        qmgr_selector_raw: "{{ qmgr_name | string | lower | trim }}"
+
+    # Purpose: Confirm app and environment are configured.
+    - name: "Pre-flight - Validate app and environment are configured"
+      ansible.builtin.assert:
+        that:
+          - app_prefix is match('^[a-z0-9]{3}$')
+          - env_upper in env_qmgr_abbr
+          - env_upper in env_repo_map
+          - env_upper in env_branch_map
+          - env_upper in env_instance_type_map
+          - env_upper in env_region_map
+        fail_msg: >-
+          app_sys_id must be a 3-character application ID and
+          mq_environment must be configured in nativeha_qmgr_control_vars.yaml.
+          Got app_sys_id={{ app_sys_id | default('undefined') }},
+          mq_environment={{ mq_environment | default('undefined') }}.
+
+    # Purpose: Derive the GitOps repository path for the selected queue manager.
+    - name: "Identity - Derive target repo, root path, and selector values"
+      ansible.builtin.set_fact:
+        env_code: "{{ env_qmgr_abbr[env_upper] | lower }}"
+        git_repo_url: "{{ env_repo_map[env_upper] }}"
+        target_branch: "{{ env_branch_map[env_upper] }}"
+        instance_type: "{{ env_instance_type_map[env_upper] }}"
+        qmgr_root_rel: >-
+          {{
+            ('queue_managers/' ~ qmgr_env_subdir_map[env_upper])
+            if env_upper in (qmgr_env_subdir_map | default({}))
+            else 'queue_managers'
+          }}
+        qmgr_select_all: "{{ qmgr_selector_raw == 'all' }}"
+        qmgr_requested_list: >-
+          {{
+            []
+            if qmgr_selector_raw == 'all'
+            else (qmgr_selector_raw.split(',')
+                  | map('trim')
+                  | reject('equalto', '')
+                  | unique
+                  | list)
+          }}
+
+    # Purpose: Stop early if the requested queue manager scope is empty or malformed.
+    - name: "Pre-flight - Validate queue manager selector"
+      ansible.builtin.assert:
+        that:
+          - qmgr_select_all | bool or qmgr_requested_list | length > 0
+        fail_msg: >-
+          qmgr_name must be all, a single queue manager name, or a
+          comma-separated list of queue manager names.
+
+    # Purpose: Stop early if any supplied queue manager name is malformed.
+    - name: "Pre-flight - Validate explicit queue manager names"
+      ansible.builtin.assert:
+        that:
+          - item is match('^' ~ app_prefix ~ env_code ~ '[0-9]{3}$')
+        fail_msg: >-
+          qmgr_name={{ item }} does not match app_sys_id={{ app_prefix }}
+          and mq_environment={{ env_upper }}. Expected pattern:
+          {{ app_prefix }}{{ env_code }}<3-digit-seq>.
+      loop: "{{ qmgr_requested_list }}"
+      when: not qmgr_select_all | bool
+
+    # Purpose: Use a run-specific checkout so parallel jobs do not share files.
+    - name: "Git - Isolate working directory for this run"
+      ansible.builtin.set_fact:
+        git_work_dir_base: "{{ git_work_dir }}"
+        git_work_dir: "{{ git_work_dir }}/mq_upgrade_{{ app_prefix }}_{{ env_upper | lower }}_{{ now(utc=false, fmt='%Y%m%d%H%M%S') }}_{{ 1000000 | random }}"
+
+    # Purpose: Build the requested MQ image value from operator input.
+    - name: "Upgrade - Derive requested values"
+      ansible.builtin.set_fact:
+        _upgrade_version: "{{ new_mq_version | trim }}"
+        _upgrade_license_id: "{{ new_license_id | default((license_ids.PROD if env_upper == 'PROD' else license_ids.NONPROD), true) | trim }}"
+        _upgrade_image: "{{ mq_image_registry }}/{{ mq_image_repository }}:{{ new_mq_version | trim }}"
+
+    # Purpose: Confirm requested image values.
+    - name: "Pre-flight - Validate requested image values"
+      ansible.builtin.assert:
+        that:
+          - _upgrade_version is match('^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$')
+          - _upgrade_license_id | length > 0
+          - _upgrade_license_id is not search('[\r\n]')
+        fail_msg: |-
+          The requested MQ image values are invalid.
+
+          new_mq_version must be a valid container image tag, for example 9.4.5.0-r2.
+          new_license_id must be supplied directly or configured in license_ids for {{ env_upper }}.
+          No Git changes were made.
+        quiet: true
+
+    # Purpose: Create the parent directory for temporary Git checkouts.
+    - name: "Git - Ensure work base exists"
+      ansible.builtin.file:
+        path: "{{ git_work_dir_base }}"
+        state: directory
+        mode: "0755"
+      check_mode: false
+
+    # Purpose: Clone the target repository and set the automation Git identity.
+    - name: "Git - Clone and configure target repo"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: git_clone_and_configure
+
+    # Purpose: Serialize direct-mode GitOps changes before reading and rendering patch files.
+    - name: "Git - Acquire direct publish lock"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: direct_publish_lock_acquire
+      vars:
+        direct_publish_lock_sync_after_acquire: true
+
+    # Purpose: Confirm queue manager root exists.
+    - name: "Discovery - Check queue manager root exists"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ qmgr_root_rel }}"
+      register: _qmgr_root_stat
+
+    # Purpose: Stop when queue manager root is missing.
+    - name: "Discovery - Fail if queue manager root is missing"
+      ansible.builtin.assert:
+        that:
+          - _qmgr_root_stat.stat.exists
+          - _qmgr_root_stat.stat.isdir
+        fail_msg: >-
+          Queue manager root {{ qmgr_root_rel }} does not exist in
+          {{ git_repo_url }} branch {{ target_branch }} for {{ env_upper }}.
+
+    # Purpose: Read existing queue manager files so only real targets are changed.
+    - name: "Discovery - Find all queue managers for selected app and environment"
+      ansible.builtin.find:
+        paths: "{{ git_work_dir }}/{{ qmgr_root_rel }}"
+        file_type: directory
+        recurse: false
+        use_regex: true
+        patterns: "^{{ app_prefix }}{{ env_code }}[0-9]{3}$"
+      register: _upgrade_all_qmgr_dirs
+      when: qmgr_select_all | bool
+
+    # Purpose: Store the exact queue managers selected by the operator.
+    - name: "Discovery - Set targets from all selector"
+      ansible.builtin.set_fact:
+        qmgr_target_names: >-
+          {{
+            _upgrade_all_qmgr_dirs.files
+            | map(attribute='path')
+            | map('basename')
+            | sort
+            | list
+          }}
+      when: qmgr_select_all | bool
+
+    # Purpose: Store the exact queue managers selected by the operator.
+    - name: "Discovery - Set targets from explicit selector"
+      ansible.builtin.set_fact:
+        qmgr_target_names: "{{ qmgr_requested_list }}"
+      when: not qmgr_select_all | bool
+
+    # Purpose: Stop when no queue managers were selected.
+    - name: "Discovery - Fail if no queue managers were selected"
+      ansible.builtin.assert:
+        that:
+          - qmgr_target_names | length > 0
+        fail_msg: >-
+          No queue managers matched app_sys_id={{ app_prefix }},
+          mq_environment={{ env_upper }}, qmgr_name={{ qmgr_name }}.
+
+    # Purpose: Confirm selected queue manager directories.
+    - name: "Discovery - Check selected queue manager directories"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ qmgr_root_rel }}/{{ item }}"
+      loop: "{{ qmgr_target_names }}"
+      register: _qmgr_dir_stats
+
+    # Purpose: List selected queue managers that do not exist in the GitOps repo.
+    - name: "Discovery - Collect missing queue manager directories"
+      ansible.builtin.set_fact:
+        _missing_qmgr_dirs: "{{ _qmgr_dir_stats.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+
+    # Purpose: Stop when selected queue managers do not exist.
+    - name: "Discovery - Fail if selected queue managers do not exist"
+      ansible.builtin.fail:
+        msg: >-
+          Selected queue managers do not exist under {{ qmgr_root_rel }}:
+          {{ _missing_qmgr_dirs }}.
+      when: _missing_qmgr_dirs | length > 0
+
+    # Purpose: Confirm selected overlay directories.
+    - name: "Discovery - Check selected overlay directories"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ qmgr_root_rel }}/{{ item }}/overlays"
+      loop: "{{ qmgr_target_names }}"
+      register: _overlay_dir_stats
+
+    # Purpose: List selected queue managers that do not have required overlay directories.
+    - name: "Discovery - Collect queue managers missing overlays"
+      ansible.builtin.set_fact:
+        _missing_overlay_dirs: "{{ _overlay_dir_stats.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+
+    # Purpose: Stop when overlays are missing.
+    - name: "Discovery - Fail if overlays are missing"
+      ansible.builtin.fail:
+        msg: >-
+          Selected queue managers are missing overlays directories:
+          {{ _missing_overlay_dirs }}. Ensure they were onboarded with the
+          Base + Overlays layout first.
+      when: _missing_overlay_dirs | length > 0
+
+    # Purpose: Confirm shared image patch files.
+    - name: "Discovery - Check shared image patch files"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ qmgr_root_rel }}/{{ item }}/overlays/_shared/patches/qm-image-patch.yaml"
+      loop: "{{ qmgr_target_names }}"
+      register: _upgrade_shared_patch_stats
+
+    # Purpose: Build the exact patch file paths this run is allowed to edit.
+    - name: "Discovery - Compute shared image patch paths"
+      ansible.builtin.set_fact:
+        _shared_upgrade_patch_paths: >-
+          {% set paths = [] -%}
+          {% for result in _upgrade_shared_patch_stats.results if result.stat.exists -%}
+          {{ paths.append(qmgr_root_rel ~ '/' ~ result.item ~ '/overlays/_shared/patches/qm-image-patch.yaml') or '' }}
+          {%- endfor -%}
+          {{ paths }}
+        _missing_upgrade_patches: "{{ _upgrade_shared_patch_stats.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+
+    # Purpose: Stop when shared image patches are missing.
+    - name: "Discovery - Fail if shared image patches are missing"
+      ansible.builtin.fail:
+        msg: >-
+          Missing qm-image-patch.yaml files for selected queue managers:
+          {{ _missing_upgrade_patches }}. Image upgrade requires
+          overlays/_shared/patches/qm-image-patch.yaml.
+      when: _missing_upgrade_patches | length > 0
+
+    # Purpose: Build the exact patch file paths this run is allowed to edit.
+    - name: "Discovery - Compute expected image patch paths"
+      ansible.builtin.set_fact:
+        _expected_upgrade_patch_paths: "{{ _shared_upgrade_patch_paths | sort | list }}"
+
+    # Purpose: Resolve the exact region list selected for this change.
+    - name: "Discovery - Compute selected regions"
+      ansible.builtin.set_fact:
+        _target_regions: "{{ env_region_map[env_upper] }}"
+        _qmgr_target_names_upper: "{{ qmgr_target_names | map('upper') | list }}"
+
+    # Purpose: Prepare the image upgrade result shown to the operator.
+    - name: "Upgrade - Display summary"
+      ansible.builtin.debug:
+        msg:
+          - "MQ upgrade plan"
+          - "Application ID : {{ app_prefix | upper }}"
+          - "Environment    : {{ env_upper }}"
+          - "Selector       : {{ qmgr_selector_raw }}"
+          - "Queue Managers : {{ _qmgr_target_names_upper | join(', ') }}"
+          - "Version        : {{ _upgrade_version }}"
+          - "License ID     : {{ _upgrade_license_id }}"
+          - "Image          : {{ _upgrade_image }}"
+          - "Patch Files    : {{ _expected_upgrade_patch_paths | length }}"
+          - "Regions        : {{ _target_regions | join(', ') }}"
+          - "Target Repo    : {{ git_repo_url }}"
+          - "Target Branch  : {{ target_branch }}"
+
+    # Purpose: Write the requested MQ image into the shared image patch.
+    - name: "Upgrade - Render qm-image-patch.yaml for selected patch files"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../../nativeha_templates/overlays/qm_image_patch.yaml.j2"
+        dest: "{{ git_work_dir }}/{{ item }}"
+        mode: "0644"
+      vars:
+        mq_version: "{{ _upgrade_version }}"
+        license_id: "{{ _upgrade_license_id }}"
+      loop: "{{ _expected_upgrade_patch_paths }}"
+
+    # Purpose: Build overlay paths that must render cleanly before publish.
+    - name: "Validation - Compute regional overlay render paths"
+      ansible.builtin.set_fact:
+        _upgrade_target_overlay_paths: >-
+          {% set paths = [] -%}
+          {% for qname in qmgr_target_names -%}
+          {% for rname in env_region_map[env_upper] -%}
+          {{ paths.append(qmgr_root_rel ~ '/' ~ qname ~ '/overlays/' ~ rname) or '' }}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ paths | sort }}
+
+    # Purpose: Render and validate selected regional overlays using shared task.
+    - name: "Validation - Render selected regional overlays"
+      ansible.builtin.include_tasks: "{{ role_path }}/../gitops_publish/tasks/validate_kustomize_render.yaml"
+      vars:
+        _kustomize_overlay_paths: >-
+          {{
+            _upgrade_target_overlay_paths
+            | map('regex_replace', '^(.*)$', git_work_dir ~ '/\1')
+            | list
+          }}
+
+    # Purpose: Check that rendered overlays contain the requested MQ image values.
+    - name: "Validation - Check rendered image values"
+      ansible.builtin.assert:
+        that:
+          - "_upgrade_version in item.stdout"
+          - "_upgrade_image in item.stdout"
+          - "_upgrade_license_id in item.stdout"
+        fail_msg: >-
+          Render validation failed for overlay {{ item.item }}. Expected
+          requested MQ version, image, and license ID in rendered QueueManager.
+      loop: "{{ _render_results.results }}"
+
+    # Purpose: Read Git status paths so only expected files are allowed.
+    - name: "Git - Check pending upgrade changes"  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: git status --porcelain
+      args:
+        chdir: "{{ git_work_dir }}"
+      register: _upgrade_git_status
+      changed_when: false
+      check_mode: false
+
+    # Purpose: Convert Git status output into paths checked against the allow-list.
+    - name: "Git - Classify pending upgrade change paths"
+      ansible.builtin.set_fact:
+        _upgrade_changed_paths: "{{ _upgrade_git_status.stdout_lines | map('regex_replace', '^.. +', '') | list }}"
+        _upgrade_unexpected_paths: >-
+          {{
+            (_upgrade_git_status.stdout_lines
+             | map('regex_replace', '^.. +', '')
+             | list)
+            | difference(_expected_upgrade_patch_paths)
+          }}
+
+    # Purpose: Stop when image upgrade changed unexpected files.
+    - name: "Git - Fail if image upgrade changed unexpected files"
+      ansible.builtin.assert:
+        that:
+          - _upgrade_unexpected_paths | length == 0
+        fail_msg: >-
+          Image upgrade changed unexpected files: {{ _upgrade_unexpected_paths }}.
+          Expected only discovered image patches: {{ _expected_upgrade_patch_paths }}.
+
+    # Purpose: Choose publish identity from inputs and defaults.
+    - name: "Git - Resolve publish identity"
+      ansible.builtin.set_fact:
+        _upgrade_publish_subject: >-
+          {{
+            qmgr_target_names[0]
+            if qmgr_target_names | length == 1
+            else app_prefix ~ '-' ~ (env_upper | lower) ~ '-image-upgrade'
+          }}
+        _upgrade_publish_title_subject: >-
+          {{
+            (qmgr_target_names[0] | upper)
+            if qmgr_target_names | length == 1
+            else (app_prefix | upper) ~ ' ' ~ env_upper ~ ' image upgrade'
+          }}
+        _upgrade_publish_repo_path: >-
+          {{
+            qmgr_root_rel ~ '/' ~ qmgr_target_names[0]
+            if qmgr_target_names | length == 1
+            else qmgr_root_rel
+          }}
+        _upgrade_publish_changelog_path: >-
+          {{
+            qmgr_root_rel ~ '/' ~ qmgr_target_names[0] ~ '/CHANGELOG.md'
+            if qmgr_target_names | length == 1
+            else qmgr_root_rel ~ '/CHANGELOG.md'
+          }}
+
+    # Purpose: Prepare the title, summary, and validation text for the GitOps change.
+    - name: "Git - Prepare target repo publish metadata"
+      ansible.builtin.set_fact:
+        qmgr_name_normalized: "{{ _upgrade_publish_subject }}"
+        target_repo_pr_action_slug: "image-upgrade"
+        target_repo_pr_action_label: "Image Upgrade"
+        target_repo_pr_branch_subject: "{{ _upgrade_publish_subject }}"
+        target_repo_pr_title_subject: "{{ _upgrade_publish_title_subject }}"
+        target_repo_pr_qmgr_label: "{{ _qmgr_target_names_upper | join(', ') }}"
+        target_repo_pr_changelog_path: "{{ _upgrade_publish_changelog_path }}"
+        target_repo_pr_repo_path: "{{ _upgrade_publish_repo_path }}"
+        target_repo_pr_summary: >-
+          Upgrade {{ _qmgr_target_names_upper | join(', ') }} in {{ env_upper }}
+          for app {{ app_prefix | upper }} to MQ version {{ _upgrade_version }}
+          using image {{ _upgrade_image }} and license ID
+          {{ _upgrade_license_id }}.
+        target_repo_pr_validation: >-
+          Discovered {{ _expected_upgrade_patch_paths | length }}
+          qm-image-patch.yaml files from Git for selected queue managers,
+          rendered updated image patches, validated selected regional overlays,
+          and confirmed no unexpected files changed before adding changelog
+          metadata.
+
+    # Purpose: Publish the prepared GitOps changes by pull request or direct commit.
+    - name: "Git - Publish target repo changes"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: target_repo_publish
+
+    # Purpose: Stop cleanly when requested values already match the repo.
+    - name: "Upgrade - No changes required"
+      ansible.builtin.debug:
+        msg: >-
+          No upgrade changes were required for
+          {{ _qmgr_target_names_upper | join(', ') }}.
+      when:
+        - not ansible_check_mode
+        - not target_repo_pr_result.changed | bool
+
+    # Purpose: Record the workflow result for final reporting.
+    - name: "Upgrade - Complete"
+      ansible.builtin.debug:
+        msg:
+          - "Upgrade complete"
+          - "Application ID : {{ app_prefix | upper }}"
+          - "Environment    : {{ env_upper }}"
+          - "Queue Managers : {{ _qmgr_target_names_upper | join(', ') }}"
+          - "Version        : {{ _upgrade_version }}"
+          - "Base Branch    : {{ target_branch }}"
+          - "Change Mode    : {{ target_repo_pr_result.mode | default(target_repo_change_mode | default('pull_request')) }}"
+          - "Publish Branch : {{ target_repo_pr_result.branch | default('not created') }}"
+          - "PR URL         : {{ target_repo_pr_result.pull_request_url | default('not created') }}"
+
+  rescue:
+    # Purpose: Save the real failure detail before the final report is built.
+    - name: "Rescue - Capture upgrade failure detail"
+      ansible.builtin.set_fact:
+        _qmgr_upgrade_failure_detail: >-
+          {{
+            ansible_failed_result.msg
+            | default(
+                ansible_failed_result.stderr
+                | default('MQ image upgrade failed before a detailed cause was returned.')
+              )
+            | string
+            | regex_replace('\n{3,}', '\n\n')
+            | trim
+          }}
+
+    # Purpose: Print the captured failure detail in the job log.
+    - name: "Rescue - Log upgrade failure"
+      ansible.builtin.debug:
+        msg:
+          - "MQ upgrade failed"
+          - "Application ID : {{ app_sys_id | default('not supplied') | upper }}"
+          - "Queue Selector : {{ qmgr_name | default('not supplied') }}"
+          - "Environment    : {{ mq_environment | default('not supplied') | upper }}"
+          - "Root Cause     : {{ _qmgr_upgrade_failure_detail }}"
+
+    # Purpose: End the AAP job as failed after reporting the original problem.
+    - name: "Rescue - Re-raise upgrade failure"
+      ansible.builtin.fail:
+        msg: |-
+          MQ image upgrade failed.
+
+          {{ _qmgr_upgrade_failure_detail }}
+
+  always:
+    # Purpose: Release the direct publish lock before removing the temporary checkout.
+    - name: "Always - Release direct publish lock"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: direct_publish_lock_release
+      when: _direct_publish_lock_acquired | default(false) | bool
+
+    # Purpose: Remove temporary files created during this run.
+    - name: "Always - Remove git working directory"
+      ansible.builtin.file:
+        path: "{{ git_work_dir }}"
+        state: absent
+      when:
+        - git_work_dir is defined
+        - git_work_dir_base is defined
+        - git_work_dir != git_work_dir_base
+      check_mode: false

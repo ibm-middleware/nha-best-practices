@@ -1,0 +1,60 @@
+---
+# NativeHA_Qmgr_Sizing_Update.yaml - Day-2 Queue Manager Sizing
+# Purpose:
+#   Recomputes the queue manager size tier from the same inputs used during
+#   Day-1 onboarding, then updates only
+#   overlays/_shared/patches/qm-sizing-patch.yaml in the target GitOps repo.
+# AAP survey variables:
+# Variables loaded from nativeha_qmgr_control_vars.yaml:
+# Important behavior:
+
+# Purpose: Update queue manager sizing patches for the selected queue managers.
+- name: "NativeHA Queue Manager Sizing Update - {{ qmgr_name | default('UNDEFINED') | upper }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  tasks:
+    # Purpose: Update queue manager sizing patches for the selected queue managers.
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    # Purpose: Update queue manager sizing patches for the selected queue managers.
+    - name: "Run queue manager sizing update workflow"
+      block:
+        # Purpose: Update queue manager sizing patches for the selected queue managers.
+        - name: "Queue manager sizing update - Execute"
+          ansible.builtin.include_role:
+            name: qmgr_sizing_update
+
+        # Purpose: Update queue manager sizing patches for the selected queue managers.
+        - name: "Queue manager sizing update - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        # Purpose: Update queue manager sizing patches for the selected queue managers.
+        - name: "Queue manager sizing update - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        # Purpose: Update queue manager sizing patches for the selected queue managers.
+        - name: "Queue manager sizing update - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Queue Manager Sizing Update"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Recompute sizing for selected queue managers and publish only the
+              shared sizing patch changes.
+
+        # Purpose: Update queue manager sizing patches for the selected queue managers.
+        - name: "Queue manager sizing update - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Queue manager sizing update failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

@@ -1,0 +1,55 @@
+---
+# Purpose: Renew selected queue manager certificates through the certificate lifecycle roles.
+- name: "NativeHA Certificate Renew"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+    - ../../../nativeha_templates/global_vars/certs_control_vars.yaml
+
+  vars:
+    cert_force_renew: true
+
+  tasks:
+    # Purpose: Renew selected queue manager certificates through the certificate lifecycle roles.
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    # Purpose: Renew selected queue manager certificates through the certificate lifecycle roles.
+    - name: "Run certificate renew workflow"
+      block:
+        # Purpose: Renew selected queue manager certificates through the certificate lifecycle roles.
+        - name: "Certificate renew - Execute"
+          ansible.builtin.include_role:
+            name: cert_onboard
+
+        # Purpose: Renew selected queue manager certificates through the certificate lifecycle roles.
+        - name: "Certificate renew - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        # Purpose: Renew selected queue manager certificates through the certificate lifecycle roles.
+        - name: "Certificate renew - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        # Purpose: Renew selected queue manager certificates through the certificate lifecycle roles.
+        - name: "Certificate renew - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Certificate Renew"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Force-renew NativeHA certificates through the CSR/PEM flow,
+              deliver the new material, and refresh the registry metadata.
+
+        # Purpose: Renew selected queue manager certificates through the certificate lifecycle roles.
+        - name: "Certificate renew - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Certificate renew failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

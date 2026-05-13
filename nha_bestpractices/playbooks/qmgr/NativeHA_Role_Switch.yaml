@@ -1,0 +1,59 @@
+---
+# NativeHA_Role_Switch.yaml - CRR Role Switch Playbook
+# Purpose:
+#   Performs a staged CRR Live/Recovery role switch by updating only
+#   the local role value in each regional role patch.
+# AAP survey variables:
+# Variables loaded from nativeha_qmgr_control_vars.yaml:
+# Variables derived inside the role:
+
+# Purpose: Switch the active CRR role for selected queue managers.
+- name: "NativeHA Role Switch - {{ qmgr_name | default('UNDEFINED') | upper }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  tasks:
+    # Purpose: Switch the active CRR role for selected queue managers.
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    # Purpose: Switch the active CRR role for selected queue managers.
+    - name: "Run CRR role switch workflow"
+      block:
+        # Purpose: Switch the active CRR role for selected queue managers.
+        - name: "CRR role switch - Execute"
+          ansible.builtin.include_role:
+            name: qmgr_role_switch
+
+        # Purpose: Switch the active CRR role for selected queue managers.
+        - name: "CRR role switch - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        # Purpose: Switch the active CRR role for selected queue managers.
+        - name: "CRR role switch - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        # Purpose: Switch the active CRR role for selected queue managers.
+        - name: "CRR role switch - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "CRR Role Switch"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Stage or complete a NativeHA CRR live/recovery role switch by
+              updating only regional role patch files.
+
+        # Purpose: Switch the active CRR role for selected queue managers.
+        - name: "CRR role switch - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('CRR role switch failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

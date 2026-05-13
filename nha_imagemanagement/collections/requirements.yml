@@ -1,7 +1,0 @@
----
-# AAP Project sync requirements when SCM points at NativeHA_Image_Upgrade/.
-
-collections:
-  - name: community.general
-    version: ">=8.0.0"
-    source: https://galaxy.ansible.com

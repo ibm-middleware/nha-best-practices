@@ -1,0 +1,168 @@
+---
+# Purpose: Load the selected queue manager facts for this target.
+- name: "Diagnostics target - Set context"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/set_current_target.yaml"
+
+# Purpose: Confirm namespace access before reading or writing OpenShift Secrets.
+- name: "Diagnostics target - OpenShift namespace/connectivity check"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_store_ocp/tasks/validate_namespaces.yaml"
+  when: diagnostic_mode_effective in ['openshift_connectivity', 'openshift_namespace_check']
+
+# Purpose: Store OpenShift connectivity diagnostics for the final report.
+- name: "Diagnostics target - Record OpenShift connectivity result"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'qmgr_name': qmgr_name,
+            'namespace': namespace,
+            'target': qmgr_name | upper,
+            'check': 'OpenShift namespace access',
+            'status': 'passed',
+            'detail': 'Validated namespace and Secret permissions for regions ' ~ (target_regions | join(', '))
+          }
+        ]
+      }}
+  when: diagnostic_mode_effective in ['openshift_connectivity', 'openshift_namespace_check']
+
+# Purpose: Start OpenShift Secret diagnostics for this target.
+- name: "Diagnostics target - OpenShift secret read"
+  when: diagnostic_mode_effective == 'openshift_secret_read'
+  block:
+    # Purpose: Confirm namespace access before reading or writing OpenShift Secrets.
+    - name: "Diagnostics target - Validate namespaces before secret read"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_store_ocp/tasks/validate_namespaces.yaml"
+
+    # Purpose: Read the existing OpenShift Secret before merge, delete, or diagnostics.
+    - name: "Diagnostics target - Read OpenShift secrets"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_store_ocp/tasks/read_secret.yaml"
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+
+    # Purpose: Record that OpenShift Secret diagnostics finished for this target.
+    - name: "Diagnostics target - OpenShift secret read complete"
+      ansible.builtin.debug:
+        msg: "Secret read diagnostic completed for {{ qmgr_name | upper }}."
+
+    # Purpose: Store OpenShift Secret read diagnostics for the final report.
+    - name: "Diagnostics target - Record OpenShift secret read result"
+      ansible.builtin.set_fact:
+        nativeha_report_diagnostic_results: >-
+          {{
+            nativeha_report_diagnostic_results | default([])
+            + [
+              {
+                'mode': diagnostic_mode_effective,
+                'qmgr_name': qmgr_name,
+                'namespace': namespace,
+                'target': qmgr_name | upper,
+                'check': 'OpenShift Secret read',
+                'status': 'passed',
+                'detail': 'Read completed for cert types ' ~ (active_cert_types | join(', '))
+              }
+            ]
+          }}
+
+# Purpose: Generate the CSR used to request the certificate from samplecertca.
+- name: "Diagnostics target - CSR generation"
+  when: diagnostic_mode_effective == 'csr_generate'
+  block:
+    # Purpose: Ensure the required output directory exists before writing files.
+    - name: "Diagnostics target - Create temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: _mq_csr_diag
+      register: cert_tmp_dir
+
+    # Purpose: Generate the CSR used to request the certificate from samplecertca.
+    - name: "Diagnostics target - Generate CSRs"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_onboard/tasks/generate_csr.yaml"
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+
+    # Purpose: Generate the CSR used to request the certificate from samplecertca.
+    - name: "Diagnostics target - CSR generation complete"
+      ansible.builtin.debug:
+        msg: "CSR generation succeeded for {{ qmgr_name | upper }} certs {{ active_cert_types | join(', ') }}."
+
+    # Purpose: Store CSR diagnostics for the final report.
+    - name: "Diagnostics target - Record CSR generation result"
+      ansible.builtin.set_fact:
+        nativeha_report_diagnostic_results: >-
+          {{
+            nativeha_report_diagnostic_results | default([])
+            + [
+              {
+                'mode': diagnostic_mode_effective,
+                'qmgr_name': qmgr_name,
+                'namespace': namespace,
+                'target': qmgr_name | upper,
+                'check': 'CSR generation',
+                'status': 'passed',
+                'detail': 'Generated CSRs for ' ~ (active_cert_types | join(', ')) ~ '; CN=' ~ cert_common_name
+              }
+            ]
+          }}
+
+  always:
+    # Purpose: Ensure the required output directory exists before writing files.
+    - name: "Diagnostics target - Remove CSR temp dir"
+      ansible.builtin.file:
+        path: "{{ cert_tmp_dir.path }}"
+        state: absent
+      when: cert_tmp_dir is defined and cert_tmp_dir.path is defined
+
+# Purpose: Read certificate backend data for diagnostics.
+- name: "Diagnostics target - samplecertrepo cert read"
+  when: diagnostic_mode_effective == 'samplecertrepo_cert_read'
+  block:
+    # Purpose: Read existing samplecertrepo certificate data for comparison or diagnostics.
+    - name: "Diagnostics target - Read samplecertrepo certs"
+      ansible.builtin.include_tasks: read_samplecertrepo_cert.yaml
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+
+# Purpose: Query live certificate provider status for diagnostics.
+- name: "Diagnostics target - samplecertca live diagnostic"
+  when: diagnostic_mode_effective in ['samplecertca_cert_status', 'samplecertca_get_root_certs']
+  block:
+    # Purpose: Stop early if samplecertca connection settings are incomplete.
+    - name: "Diagnostics target - Validate samplecertca settings"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/validate_samplecertca_config.yaml"
+
+    # Purpose: Get a samplecertca token before live certificate operations.
+    - name: "Diagnostics target - Authenticate to samplecertca"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/samplecertca_auth.yaml"
+
+    # Purpose: Ask samplecertca for the live certificate status used in diagnostics.
+    - name: "Diagnostics target - Query samplecertca status"
+      ansible.builtin.include_tasks: samplecertca_cert_status.yaml
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+      when: diagnostic_mode_effective == 'samplecertca_cert_status'
+
+    # Purpose: Download samplecertca signer chains for diagnostics output.
+    - name: "Diagnostics target - Retrieve samplecertca signer chains"
+      ansible.builtin.include_tasks: samplecertca_get_root_certs.yaml
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+      when: diagnostic_mode_effective == 'samplecertca_get_root_certs'
+
+  always:
+    # Purpose: Revoke the certificate from the provider when configured.
+    - name: "Diagnostics target - Revoke samplecertca token"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/samplecertca_revoke_token.yaml"
+      when: samplecertca_token | default('', true) | length > 0

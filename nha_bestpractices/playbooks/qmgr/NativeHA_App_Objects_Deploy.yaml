@@ -1,0 +1,60 @@
+---
+# NativeHA_App_Objects_Deploy.yaml - Day-2 application MQSC
+# Purpose:
+#   Deploys application-owned MQ objects through GitOps by updating the
+#   generated app MQSC file under overlays/_shared/mqsc-app/<group>/ and, by
+#   default, the regional restart patch files needed to activate the change.
+# AAP survey variables:
+# Optional:
+
+# Purpose: Validate application MQSC and publish the allowed object changes.
+- name: "NativeHA Application MQ Objects Deploy"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  tasks:
+    # Purpose: Validate application MQSC and publish the allowed object changes.
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    # Purpose: Validate application MQSC and publish the allowed object changes.
+    - name: "Run application MQ objects deploy workflow"
+      block:
+        # Purpose: Validate application MQSC and publish the allowed object changes.
+        - name: "Application MQ objects deploy - Execute"
+          ansible.builtin.include_role:
+            name: qmgr_app_objects_deploy
+
+        # Purpose: Validate application MQSC and publish the allowed object changes.
+        - name: "Application MQ objects deploy - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        # Purpose: Validate application MQSC and publish the allowed object changes.
+        - name: "Application MQ objects deploy - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        # Purpose: Validate application MQSC and publish the allowed object changes.
+        - name: "Application MQ objects deploy - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Application MQ Objects Deploy"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Publish application MQSC object definitions through GitOps after
+              validating scope, command policy, activation plan, render output,
+              and changed files.
+
+        # Purpose: Validate application MQSC and publish the allowed object changes.
+        - name: "Application MQ objects deploy - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Application MQ objects deploy failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

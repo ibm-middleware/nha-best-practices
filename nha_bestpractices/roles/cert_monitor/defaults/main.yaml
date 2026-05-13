@@ -1,0 +1,5 @@
+---
+# Registry-only monitor by default. Inputs:
+# app_sys_id, mq_environment, and qmgr_name (single, comma-separated, or all).
+
+cert_monitor_source: "registry"  # noqa var-naming[no-role-prefix]

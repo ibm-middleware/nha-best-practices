@@ -1,0 +1,354 @@
+---
+# Registry-only certificate monitor. Live checks are handled by diagnostics.
+
+# Purpose: Check monitor inputs before reading certificate inventory.
+- name: "Monitor - Validate registry monitor inputs"
+  ansible.builtin.assert:
+    that:
+      - cert_monitor_source | default('registry') == 'registry'
+      - cert_registry_enabled | default(false) | bool
+      - app_sys_id | default('', true) | trim | length > 0
+      - mq_environment | default('', true) | trim | length > 0
+    fail_msg: >-
+      Registry monitor requires app_sys_id and mq_environment, and it also
+      requires NATIVEHA_CERT_REGISTRY_ENABLED=true because the monitor reads
+      nativeha_state/cert_registry/cert_inventory.yaml. Use live diagnostics
+      for OpenShift, samplecertrepo, or samplecertca checks when the registry is disabled.
+      qmgr_name is optional; when supplied it may be one queue manager, a
+      comma-separated list, or all.
+    quiet: true
+
+# Purpose: Trim and standardize operator input before validation.
+- name: "Monitor - Normalize inputs"
+  ansible.builtin.set_fact:
+    app_prefix: "{{ app_sys_id | lower | trim }}"
+    env_upper: "{{ mq_environment | upper | trim }}"
+    qmgr_selector_display: "{{ qmgr_name | default('all', true) | string | trim }}"
+    qmgr_selector_raw: "{{ qmgr_name | default('all', true) | string | lower | trim }}"
+
+# Purpose: Stop early if app or environment is missing or unsupported.
+- name: "Monitor - Validate app/environment"
+  ansible.builtin.assert:
+    that:
+      - app_prefix is match('^[a-z0-9]{3}$')
+      - env_upper in env_qmgr_abbr
+    fail_msg: >-
+      app_sys_id={{ app_sys_id | default('undefined') }} or
+      mq_environment={{ mq_environment | default('undefined') }} is invalid.
+    quiet: true
+
+# Purpose: Read certificate inventory before deciding what must change.
+- name: "Monitor - Read certificate registry"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/read_registry.yaml"
+
+# Purpose: Start an empty selected queue manager list before applying filters.
+- name: "Monitor - Initialize selected queue managers"
+  ansible.builtin.set_fact:
+    _monitor_qmgr_names: >-
+      {{
+        []
+        if qmgr_selector_raw == 'all'
+        else (qmgr_selector_raw.split(',')
+              | map('trim')
+              | reject('equalto', '')
+              | unique
+              | list)
+      }}
+
+# Purpose: Expand all into queue managers from the certificate inventory.
+- name: "Monitor - Select all matching registry entries"
+  ansible.builtin.set_fact:
+    _monitor_qmgr_names: "{{ _monitor_qmgr_names + [item.key | lower] }}"
+  loop: "{{ cert_registry | dict2items }}"
+  when:
+    - qmgr_selector_raw == 'all'
+    - item.value.app_sys_id | default(item.value.app_prefix | default('')) | lower == app_prefix
+    - item.value.environment | default('') | upper == env_upper
+
+# Purpose: Sort queue managers so monitor output is stable.
+- name: "Monitor - Sort selected queue managers"
+  ansible.builtin.set_fact:
+    _monitor_qmgr_names: "{{ _monitor_qmgr_names | unique | sort | list }}"
+
+# Purpose: Confirm selected queue managers.
+- name: "Monitor - Validate selected queue managers"
+  ansible.builtin.assert:
+    that:
+      - _monitor_qmgr_names | length > 0
+      - item is match('^' ~ app_prefix ~ (env_qmgr_abbr[env_upper] | lower) ~ '[0-9]{3}$')
+      - item in cert_registry
+      - cert_registry[item].app_sys_id | default(cert_registry[item].app_prefix | default('')) | lower == app_prefix
+      - cert_registry[item].environment | default('') | upper == env_upper
+    fail_msg: >-
+      Queue manager selector {{ qmgr_selector_raw }} did not resolve to registry
+      entries matching app_sys_id={{ app_prefix }} and
+      mq_environment={{ env_upper }}. Explicit queue managers must match
+      {{ app_prefix }}{{ env_qmgr_abbr[env_upper] | lower }}<3-digit-seq> and
+      must have matching registry metadata.
+    quiet: true
+  loop: "{{ _monitor_qmgr_names }}"
+
+# Purpose: Build one monitor row per expected certificate type for each queue manager.
+- name: "Monitor - Build report entries"
+  ansible.builtin.set_fact:
+    _monitor_report: "{{ _monitor_report | default([]) + [_report_entry_json | from_json] }}"
+    _monitor_alert_entries: >-
+      {{
+        (_monitor_alert_entries | default([]))
+        + (
+          [(_report_entry_json | from_json)]
+          if (((_report_entry_json | from_json).alerts | default([]) | length) > 0)
+          else []
+        )
+      }}
+  vars:
+    _report_entry_json: >-
+      {% set qmgr_entry = cert_registry[item] -%}
+      {% set certs = qmgr_entry.certs | default({}) -%}
+      {% set instance_type = qmgr_entry.instance_type | default('nha') -%}
+      {% set instance_cert_map_effective = instance_cert_map | default({}) -%}
+      {% set default_profile = instance_cert_map_effective[instance_type] | default([]) -%}
+      {% set expected_cert_types = qmgr_entry.cert_profile | default(default_profile) -%}
+      {% set alert_statuses = alert_on_statuses | default(['expiring_soon', 'expired', 'missing', 'corrupt', 'revoked', 'desync']) -%}
+      {% set missing_cert_types = expected_cert_types | difference(certs.keys() | list) -%}
+      {% set alerts = [] -%}
+      {% for cert_type in missing_cert_types -%}
+      {% if 'missing' in alert_statuses -%}
+      {{ alerts.append({
+          'cert_type': cert_type,
+          'alert_status': 'missing',
+          'detail': 'certificate type missing from registry'
+        }) or '' }}
+      {%- endif %}
+      {%- endfor %}
+      {% for cert in certs | dict2items -%}
+      {% set cert_status = cert.value.status | default('missing') -%}
+      {% set has_days = cert.value.days_remaining is defined and (cert.value.days_remaining | string | length > 0) -%}
+      {% if cert_status == 'active' and has_days and (cert.value.days_remaining | int) <= 0 and 'expired' in alert_statuses -%}
+      {{ alerts.append({
+          'cert_type': cert.key,
+          'alert_status': 'expired',
+          'detail': 'expired ' ~ ((cert.value.days_remaining | int) | abs) ~ ' day(s) ago'
+        }) or '' }}
+      {%- elif (
+            cert_status == 'active'
+            and has_days
+            and (cert.value.days_remaining | int)
+              <= (cert_renewal_threshold_days | default(30) | int)
+            and 'expiring_soon' in alert_statuses
+          ) -%}
+      {{ alerts.append({
+          'cert_type': cert.key,
+          'alert_status': 'expiring_soon',
+          'detail': 'expires in ' ~ (cert.value.days_remaining | string) ~ ' day(s)'
+        }) or '' }}
+      {%- elif cert_status == 'active' and (not has_days) and 'corrupt' in alert_statuses -%}
+      {{ alerts.append({
+          'cert_type': cert.key,
+          'alert_status': 'corrupt',
+          'detail': 'active registry entry has no days_remaining value'
+        }) or '' }}
+      {%- elif cert_status in alert_statuses -%}
+      {{ alerts.append({
+          'cert_type': cert.key,
+          'alert_status': cert_status,
+          'detail': 'registry status=' ~ cert_status
+        }) or '' }}
+      {%- endif %}
+      {%- endfor %}
+      {% set alert_map = {} -%}
+      {% for alert in alerts -%}
+      {{ alert_map.update({(alert.cert_type | string): alert}) or '' }}{%- endfor %}
+      {% set rows = [] -%}
+      {% for cert_type in expected_cert_types -%}
+      {% set cert = certs[cert_type] | default({}) -%}
+      {% set cert_missing = cert_type in missing_cert_types -%}
+      {% set cert_status = 'missing' if cert_missing else (cert.status | default('unknown')) -%}
+      {% set alert = alert_map.get(cert_type, {}) -%}
+      {% set monitor_status = alert.alert_status | default(('healthy' if cert_status == 'active' else cert_status), true) -%}
+      {% set display_name = cert_type_samplecertrepo_subpath[cert_type] if cert_type_samplecertrepo_subpath is defined and cert_type in cert_type_samplecertrepo_subpath else cert_type -%}
+      {% set backend = cert.delivery_backend | default(qmgr_entry.delivery_backend | default('unknown'), true) -%}
+      {% set qmgr_for_secret = qmgr_entry.qmgr_name | default(item, true) -%}
+      {% set secret_name = cert.openshift_secret | default(qmgr_for_secret ~ '-' ~ display_name, true) -%}
+      {% set samplecertrepo_base = qmgr_entry.samplecertrepo_base_path | default('', true) -%}
+      {% set samplecertrepo_path = cert.samplecertrepo_path | default((samplecertrepo_base ~ '/' ~ display_name) if (samplecertrepo_base | length > 0) else '', true) -%}
+      {% set has_days = cert.days_remaining is defined and (cert.days_remaining | string | length > 0) -%}
+      {% if backend == 'samplecertrepo' and (samplecertrepo_path | length > 0) -%}
+      {% set backend_location = 'samplecertrepo: ' ~ samplecertrepo_path -%}
+      {% elif backend in ['openshift_secret', 'openshift-secret'] -%}
+      {% set backend_location = 'OpenShift Secret: ' ~ secret_name -%}
+      {% else -%}
+      {% set backend_location = backend | string -%}
+      {% endif -%}
+      {{ rows.append({
+          'cert_type': cert_type,
+          'cert_name': display_name,
+          'status': cert_status,
+          'monitor_status': monitor_status,
+          'alert_detail': alert.detail | default(''),
+          'common_name': cert.common_name | default('not captured', true),
+          'not_after': cert.not_after | default('', true),
+          'days_remaining': cert.days_remaining | default('', true),
+          'days_remaining_sort': (cert.days_remaining | int) if has_days else 999999,
+          'serial_number': cert.serial_number | default('not captured', true),
+          'backend': backend,
+          'backend_location': backend_location,
+          'last_action': cert.last_action | default('not captured', true),
+          'last_action_date': cert.last_action_date | default('not captured', true),
+          'regions': qmgr_entry.target_regions | default([])
+        }) or '' }}
+      {%- endfor %}
+      {% set nonhealthy = rows | rejectattr('monitor_status', 'equalto', 'healthy') | list -%}
+      {% set next_expiring = (rows | sort(attribute='days_remaining_sort') | first) | default({}) -%}
+      {% set alert_text = alerts | map(attribute='cert_type') | zip(alerts | map(attribute='alert_status')) | map('join', ':') | join(', ') -%}
+      {% set nonhealthy_text = nonhealthy | map(attribute='cert_type') | zip(nonhealthy | map(attribute='monitor_status')) | map('join', ':') | join(', ') -%}
+      {% set attention_text = alert_text if (alerts | length > 0) else nonhealthy_text -%}
+      {{ {
+          'qmgr_name': item,
+          'environment': qmgr_entry.environment | default(env_upper),
+          'namespace': qmgr_entry.namespace | default('unknown'),
+          'backend': qmgr_entry.delivery_backend | default('unknown'),
+          'cert_count': certs | length,
+          'expected_cert_count': expected_cert_types | length,
+          'status': ('attention' if ((alerts | length > 0) or (nonhealthy | length > 0)) else 'healthy'),
+          'attention': attention_text | default(''),
+          'alerts': alerts,
+          'certs': rows,
+          'next_expiring_cert_type': next_expiring.cert_type | default(''),
+          'next_expiring_cert_name': next_expiring.cert_name | default('not captured'),
+          'next_expiring_not_after': next_expiring.not_after | default(''),
+          'next_expiring_days': next_expiring.days_remaining | default(''),
+          'last_updated': qmgr_entry.last_updated | default('unknown')
+        } | to_json }}
+  loop: "{{ _monitor_qmgr_names }}"
+
+# Purpose: Prepare the certificate monitor result shown to the operator.
+- name: "Monitor - Certificate registry report"
+  ansible.builtin.debug:
+    msg: "{{ _report_lines.split('\n') }}"
+  vars:
+    _report_lines: |
+      NativeHA certificate registry report
+      Generated: {{ now(utc=true) | string }}
+      App: {{ app_prefix | upper }}  Env: {{ env_upper }}  Selector: {{ qmgr_selector_raw }}
+      Summary: {{ _monitor_report | selectattr('status', 'equalto', 'healthy') | list | length }} healthy,
+      {{ _monitor_report | rejectattr('status', 'equalto', 'healthy') | list | length }} attention,
+      {{ _monitor_report | length }} total
+
+      Certificate details:
+      {% for entry in _monitor_report | default([]) %}
+      {% for cert in entry.certs | default([]) %}
+      - {{ entry.qmgr_name | upper }} | {{ cert.cert_name }} | {{ cert.monitor_status }} | expires={{ cert.not_after | default('unknown', true) }} | days={{ cert.days_remaining | default('unknown', true) }} | backend={{ cert.backend | default(entry.backend | default('unknown')) }}
+      {% endfor %}
+      {% endfor %}
+
+      {% set attention_entries = _monitor_report | default([]) | rejectattr('status', 'equalto', 'healthy') | list %}
+      {% if attention_entries | length == 0 %}
+      All selected queue managers are healthy.
+      {% else %}
+      Queue managers needing attention:
+      {% for entry in attention_entries %}
+      {{ entry.qmgr_name | upper }} | {{ entry.status | upper }}
+      certs={{ entry.cert_count }}/{{ entry.expected_cert_count }}
+      next={{ entry.next_expiring_cert_name }} {{ entry.next_expiring_days }} day(s)
+      {% if entry.alerts | default([]) | length > 0 %}
+      attention=
+      {% for alert in entry.alerts %}
+      - {{ alert.cert_type }}:{{ alert.alert_status }} ({{ alert.detail }})
+      {% endfor %}
+      {% else %}
+      attention=none
+      {% endif %}
+      {% endfor %}
+      {% endif %}
+
+# Purpose: Decide whether monitor findings should send an SMTP alert.
+- name: "Monitor - Determine SMTP alert readiness"
+  ansible.builtin.set_fact:
+    _smtp_alert_ready: >-
+      {{
+        smtp_enabled | default(false) | bool
+        and smtp_host | default('', true) | trim | length > 0
+        and smtp_from | default('', true) | trim | length > 0
+        and smtp_to | default([]) | length > 0
+        and (
+          smtp_username | default('', true) | trim | length == 0
+          or smtp_password | default('', true) | trim | length > 0
+        )
+      }}
+
+# Purpose: Prepare the certificate monitor result shown to the operator.
+- name: "Monitor - Report SMTP alert configuration issue"
+  ansible.builtin.debug:
+    msg: >-
+      Certificate alerts were found, but SMTP alert delivery is skipped because
+      smtp_host, smtp_from, smtp_to, or SMTP authentication is incomplete.
+  when:
+    - smtp_enabled | default(false) | bool
+    - _monitor_alert_entries | default([]) | length > 0
+    - not (_smtp_alert_ready | default(false) | bool)
+
+# Purpose: Send the certificate monitor alert email for unhealthy findings.
+- name: "Monitor - Send SMTP certificate alert"
+  community.general.mail:
+    host: "{{ smtp_host }}"
+    port: "{{ smtp_port | int }}"
+    secure: "{{ smtp_secure | default('try') }}"
+    username: "{{ smtp_username if (smtp_username | default('', true) | trim | length > 0) else omit }}"
+    password: "{{ smtp_password if (smtp_password | default('', true) | trim | length > 0) else omit }}"
+    from: "{{ smtp_from }}"
+    to: "{{ smtp_to }}"
+    subject: "{{ smtp_subject_prefix | default('[MQ Certificate Alert]') }} {{ app_prefix | upper }} {{ env_upper }} certificate attention"
+    subtype: html
+    body: |
+      <!doctype html>
+      <html>
+      <body style="font-family:Arial,Helvetica,sans-serif;background:#f4f6f8;margin:0;padding:24px;color:#17202a;">
+        <div style="max-width:900px;margin:0 auto;background:#fff;border:1px solid #d9e2ec;border-radius:8px;overflow:hidden;">
+          <div style="background:#7f1d1d;color:#fff;padding:20px 24px;">
+            <h1 style="margin:0;font-size:22px;">MQ NativeHA Certificate Attention Required</h1>
+            <p style="margin:8px 0 0;color:#ffe0e0;">{{ app_prefix | upper }} / {{ env_upper }} / selector {{ qmgr_selector_raw }}</p>
+          </div>
+          <div style="padding:22px 24px;">
+            <p>The registry monitor found certificate entries that need operational attention.</p>
+            <table style="width:100%;border-collaQA3:collaQA3;font-size:13px;">
+              <tr>
+                <th style="text-align:left;background:#edf2f7;border:1px solid #d9e2ec;padding:10px;">Queue Manager</th>
+                <th style="text-align:left;background:#edf2f7;border:1px solid #d9e2ec;padding:10px;">Namespace</th>
+                <th style="text-align:left;background:#edf2f7;border:1px solid #d9e2ec;padding:10px;">Backend</th>
+                <th style="text-align:left;background:#edf2f7;border:1px solid #d9e2ec;padding:10px;">Alerts</th>
+              </tr>
+              {% for entry in _monitor_alert_entries | default([]) %}
+              <tr>
+                <td style="border:1px solid #d9e2ec;padding:10px;">{{ entry.qmgr_name | upper }}</td>
+                <td style="border:1px solid #d9e2ec;padding:10px;">{{ entry.namespace }}</td>
+                <td style="border:1px solid #d9e2ec;padding:10px;">{{ entry.backend }}</td>
+                <td style="border:1px solid #d9e2ec;padding:10px;">
+                  {% for alert in entry.alerts | default([]) %}
+                  <strong>{{ alert.cert_type }}</strong>: {{ alert.alert_status }} - {{ alert.detail }}<br>
+                  {% endfor %}
+                </td>
+              </tr>
+              {% endfor %}
+            </table>
+          </div>
+        </div>
+      </body>
+      </html>
+    timeout: "{{ smtp_timeout | default(20) | int }}"
+  register: _smtp_alert_result
+  failed_when: false
+  no_log: "{{ smtp_no_log | default(true) | bool }}"
+  when:
+    - smtp_enabled | default(false) | bool
+    - _monitor_alert_entries | default([]) | length > 0
+    - _smtp_alert_ready | default(false) | bool
+
+# Purpose: Prepare the certificate monitor result shown to the operator.
+- name: "Monitor - Report SMTP alert delivery issue"
+  ansible.builtin.debug:
+    msg: "SMTP alert delivery failed or was skipped: {{ _smtp_alert_result.msg | default(_smtp_alert_result) }}"
+  when:
+    - _smtp_alert_result is defined
+    - not (_smtp_alert_result.skipped | default(false) | bool)
+    - (_smtp_alert_result.msg | default('')) != 'Mail sent successfully'

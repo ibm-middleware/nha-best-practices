@@ -1,12 +1,23 @@
+{#
+  IBM MQ QueueManager custom resource template for NativeHA CRR.
+  Provides the immutable base CR for two-region cross-region replication.
+  Regional topology and local role values are left as placeholders and patched
+  by regional overlays.
+  qmgr onboarding facts: qmgr_name, namespace, qmgr_name_upper, qmgr_size,
+  mqsc_core_files, ini_files.
+  node selector, metrics, scripts, and CRR cipher settings.
+  base/qmgr.yaml for an nhacrr queue manager.
+#}
+{% set _webui_enabled = mq_webui_enabled | default(enable_webui | default(web_enabled | default(false))) | bool %}
+{% set _operator_metrics_enabled = mq_operator_metrics_enabled | default(enable_metrics | default(false)) | bool %}
 ---
-# crr-qmgr.yaml — NativeHA Cross-Region Replication (CRR) QueueManager CR
+# crr-qmgr.yaml - NativeHA Cross-Region Replication (CRR) QueueManager CR
 # Populated and deployed by Ansible automation (nativeha_templates)
 # instance_type: nhacrr
-#
-# IMPORTANT: Region-specific fields use PLACEHOLDER_* values.
-# These are replaced at deploy time by the overlay patches:
-#   overlays/<region>/<region_label>-patch-role.yaml
-# See: docs/crr-base-overlays-rationale.md
+# IMPORTANT: Region-specific fields use PLACEHOLDER_* values. Immutable
+# topology is replaced by overlays/<region>/<region_label>-patch-topology.yaml.
+# Day-2 role switch changes only overlays/<region>/<region_label>-patch-role.yaml.
+# See: docs/ARCHITECTURE.md
 apiVersion: mq.ibm.com/v1beta1
 kind: QueueManager
 metadata:
@@ -21,16 +32,21 @@ metadata:
     mq.ibm.com/instance-type: nhacrr
     mq.ibm.com/region: PLACEHOLDER_REGION
 spec:
+  annotations:
+    {{ restart_annotation_prefix }}/restart-at: "initial"
+    {{ restart_annotation_prefix }}/restart-reason: "onboarded"
+    {{ restart_annotation_prefix }}/restart-requested-by: "ansible-automation"
   version: PLACEHOLDER_MQ_VERSION
   license:
     accept: true
     license: PLACEHOLDER_LICENSE_ID
-    use: {{ license_use }}
+    cluster1: {{ license_use }}
   imagePullSecrets:
     - name: ibm-entitlement-key
 
   web:
-    enabled: {{ web_enabled }}
+    enabled: {{ _webui_enabled | ternary('true', 'false') }}
+{% if _webui_enabled %}
     console:
       authentication:
         provider: {{ web_authentication }}
@@ -39,6 +55,7 @@ spec:
     manualConfig:
       configMap:
         name: {{ qmgr_name }}-{{ web_configmap }}
+{% endif %}
 
   pki:
     keys:
@@ -48,16 +65,22 @@ spec:
           items:
             - tls.key
             - tls.crt
-    trust:
-      - name: clientca
-        secret:
-          secretName: "{{ qmgr_name }}-app-pki"
-          items:
             - ca.crt
+    trust:
+      - name: {{ mq_client_trust_source_name | default('clientcerts') }}
+        secret:
+          secretName: "{{ qmgr_name }}-{{ mq_client_trust_secret_suffix | default('client-certs') }}"
+          items:
+            - {{ mq_client_trust_default_ca_item | default('example.lab-ca.crt') }}
 
   template:
     pod:
       volumes:
+{#
+Section:
+  Optional script ConfigMap mount. Generated only when script files exist and
+  enable_scripts_configmap is true.
+#}
 {% if enable_scripts_configmap | default(true) | bool and script_files | default([]) | length > 0 %}
         - name: scripts
           configMap:
@@ -70,6 +93,16 @@ spec:
             sources:
               - configMap:
                   name: {{ qmgr_name }}-mqsc
+{% if app_mqsc_mount_in_pod | default(true) | bool and app_mqsc_groups | default([]) | length > 0 %}
+        - name: mqsc-app-config
+          projected:
+            defaultMode: 0444
+            sources:
+{% for group in app_mqsc_groups | default([]) %}
+              - configMap:
+                  name: {{ qmgr_name }}-mqsc-{{ group.suffix }}
+{% endfor %}
+{% endif %}
       containers:
         - name: qmgr
           volumeMounts:
@@ -81,6 +114,11 @@ spec:
             - name: mqsc-config
               mountPath: /mq-config
               readOnly: true
+{% if app_mqsc_mount_in_pod | default(true) | bool and app_mqsc_groups | default([]) | length > 0 %}
+            - name: mqsc-app-config
+              mountPath: /mq-app-config
+              readOnly: true
+{% endif %}
           resources:
             requests:
               cpu: "{{ qmgr_size.request_cpu }}"
@@ -117,13 +155,23 @@ spec:
       - configMap:
           name: {{ qmgr_name }}-mqsc
           items:
-{% for file in mqsc_files %}
+{#
+Section:
+  Core MQSC file references. qmgr onboarding discovers static files from
+  nativeha_templates/base/mqsc.
+#}
+{% for file in mqsc_core_files %}
             - {{ file }}
 {% endfor %}
     ini:
       - configMap:
           name: "{{ qmgr_name }}-ini"
           items:
+{#
+Section:
+  INI file references. qmgr onboarding discovers static files from
+  nativeha_templates/base/ini.
+#}
 {% for file in ini_files %}
             - {{ file }}
 {% endfor %}
@@ -144,9 +192,11 @@ spec:
             addresses:
               - "PLACEHOLDER_ADDRESS"
     metrics:
-      enabled: {{ enable_metrics | default(true) | bool | lower }}
+      enabled: {{ _operator_metrics_enabled | ternary('true', 'false') }}
+{% if _operator_metrics_enabled %}
       tls:
         provider: openshift
+{% endif %}
     readinessProbe:
       initialDelaySeconds: 30
       periodSeconds: 10
@@ -156,6 +206,7 @@ spec:
     recoveryLogs:
       logFilePages: {{ qmgr_size.log_file_pages | default(32768) }}
     storage:
+      allowVolumeExpansion: {{ (allow_volume_expansion | default(true) | bool) | ternary('true', 'false') }}
       queueManager:
         type: persistent-claim
         class: {{ storage_class_name }}

@@ -1,0 +1,7 @@
+---
+# Offboard inputs:
+# app_sys_id, mq_environment, qmgr_name, confirm=yes.
+# Optional temporary namespace override:
+# custom_openshift_namespace.
+
+confirm: ""  # noqa var-naming[no-role-prefix]

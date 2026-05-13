@@ -1,0 +1,45 @@
+---
+# git_clone_and_configure.yaml - Shared Git Clone + Identity
+# Provides a single reusable task file for cloning a target
+# repository and configuring Git identity. Used by:
+# Required variables from caller:
+
+# Purpose: Remove any stale checkout before cloning the repository.
+- name: "Git - Clean working directory"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}"
+    state: absent
+
+# Purpose: Clone the target repository and set the automation Git identity.
+- name: "Git - Clone target repo ({{ target_branch }} branch)"  # noqa name[template]
+  ansible.builtin.git:
+    repo: "{{ git_repo_url }}"
+    dest: "{{ git_work_dir }}"
+    version: "{{ target_branch }}"
+    force: true
+    accept_hostkey: "{{ git_accept_hostkey | default(true) | bool }}"
+    ssh_opts: "{{ git_ssh_options | default(omit) }}"
+
+# Purpose: Set the Git author used for automation commits.
+- name: "Git - Configure user name"
+  community.general.git_config:
+    name: "user.name"
+    value: "{{ git_user_name | default('MQ Automation') }}"
+    scope: local
+    repo: "{{ git_work_dir }}"
+
+# Purpose: Set the Git author email used for automation commits.
+- name: "Git - Configure user email"
+  community.general.git_config:
+    name: "user.email"
+    value: "{{ git_user_email | default('mq-automation@example.lab') }}"
+    scope: local
+    repo: "{{ git_work_dir }}"
+
+# Purpose: Set the SSH command for Git push/pull operations.
+- name: "Git - Configure SSH command"
+  community.general.git_config:
+    name: "core.sshCommand"
+    value: "{{ git_ssh_command | default('ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null') }}"
+    scope: local
+    repo: "{{ git_work_dir }}"

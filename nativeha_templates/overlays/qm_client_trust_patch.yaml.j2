@@ -1,0 +1,18 @@
+{#
+  Shared JSON 6902 patch for QueueManager client/signer trust items.
+  Keeps the mutable public client/signer trust item list in overlays/_shared
+  without rewriting base/qmgr.yaml. Certificate PEM data stays in the
+  <qmgr>-client-certs OpenShift Secret for direct mode, or in the shared samplecertrepo
+  path when VSO sync is enabled.
+  qmgr onboarding/global vars: mq_client_trust_default_ca_item.
+  client trust add: client_trust_items.
+  overlays/_shared/patches/qm-client-trust-patch.yaml.
+#}
+---
+# qm-client-trust-patch.yaml - JSON 6902 patch for MQ client/signer trust items
+- op: replace
+  path: /spec/pki/trust/0/secret/items
+  value:
+{% for item in client_trust_items | default([mq_client_trust_default_ca_item | default('example.lab-ca.crt')]) %}
+    - {{ item }}
+{% endfor %}

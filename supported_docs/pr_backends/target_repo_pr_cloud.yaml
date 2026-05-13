@@ -1,46 +1,20 @@
 ---
 # ============================================================
-# target_repo_pr.yaml — Bitbucket Cloud
+# target_repo_pr.yaml — git-provider Cloud
 # ============================================================
-#
-# Creates or updates a pull request on Bitbucket Cloud
-# (api.bitbucket.org) using a Bitbucket API token with Basic auth.
-#
-# To activate, copy this file into the shared_tasks directory:
-#   cp setup/pr_backends/target_repo_pr_cloud.yaml \
-#      nativeha_templates/shared_tasks/target_repo_pr.yaml
-#
+# Creates or updates a pull request on git-provider Cloud
+# (api.git.example.lab) using a git-provider API token with Basic auth.
+# To activate, copy this file into the gitops_publish role tasks directory:
 # CREDENTIALS (AAP environment variables):
-#   BITBUCKET_USERNAME plus BITBUCKET_TOKEN or BITBUCKET_CLOUD_TOKEN.
-#
 # Input variables from caller:
-#   git_work_dir              - cloned target repository working directory
-#   git_repo_url              - target repo URL; parsed to workspace/repo
-#   target_branch             - PR destination branch, for example develop
-#   env_upper                 - normalized environment, for example QA2
-#   target_repo_pr_action_slug - action code, for example image-upgrade
-#   target_repo_pr_action_label - display label, for example Image Upgrade
-#   target_repo_pr_repo_path  - queue manager path in target repo
-#   target_repo_pr_summary    - PR/changelog summary text
-#   target_repo_pr_validation - validation text written to changelog
-#
 # Optional input variables:
-#   target_repo_pr_branch_subject, target_repo_pr_title_subject,
-#   target_repo_pr_qmgr_label, and target_repo_pr_changelog_path let bulk
-#   Day-2 actions use app/env-level publish metadata.
-#
 # Derived facts created here:
-#   _pr_qmgr                 - queue manager or bulk subject used in branches
-#   _pr_app                  - app prefix used in feature/<app>/<qmgr>-qmgr
-#   _pr_qmgr_branch_prefix   - prefix used to find existing open PRs
-#   _pr_changelog_rel        - queue-manager CHANGELOG.md path
-#
 # Output fact:
-#   target_repo_pr_result - common publish result used by all callers.
-#
 # ============================================================
 
 # ── 1. Validate Inputs ──────────────────────────────────────
+# Purpose: Fails early with a clear message when required git-provider Cloud pull-request backend inputs or
+#   configuration are missing or inconsistent.
 - name: "PR — Validate inputs"
   ansible.builtin.assert:
     that:
@@ -56,6 +30,8 @@
     fail_msg: "Missing required target repo PR input facts."
 
 # ── 2. Resolve Identity ─────────────────────────────────────
+# Purpose: Derives runtime facts from AAP inputs, global variables, registry data, or earlier task output
+#   for later git-provider Cloud pull-request backend steps.
 - name: "PR — Resolve branch identity"
   ansible.builtin.set_fact:
     # Prefer an explicit branch subject for bulk Day-2 actions when supplied.
@@ -69,6 +45,9 @@
         | lower
       }}
 
+# Purpose: Derives runtime facts from AAP inputs, global variables, registry data, or earlier task output
+#   for later git-provider Cloud pull-request backend steps.
+#   target_repo_pr_title_subject
 - name: "PR — Resolve display identity"
   ansible.builtin.set_fact:
     _pr_qmgr_label: >-
@@ -82,6 +61,9 @@
         | default(target_repo_pr_qmgr_label | default((_pr_qmgr | upper), true), true)
       }}
 
+# Purpose: Derives runtime facts from AAP inputs, global variables, registry data, or earlier task output
+#   for later git-provider Cloud pull-request backend steps.
+#   target_repo_pr_repo_path
 - name: "PR — Build branch prefix"
   ansible.builtin.set_fact:
     # All action types for one queue manager share the same feature branch/PR.
@@ -96,6 +78,7 @@
       }}
 
 # ── 3. Check Pending Changes ────────────────────────────────
+# Purpose: Inspects existing state so the git-provider Cloud pull-request backend flow can decide whether to
 - name: "PR — Check pending changes"  # noqa command-instead-of-module
   ansible.builtin.command:
     cmd: git status --porcelain
@@ -105,6 +88,7 @@
   changed_when: false
   check_mode: false
 
+# Purpose: Builds, updates, or records pull-request state for the target repository change.
 - name: "PR — No changes detected"
   ansible.builtin.set_fact:
     target_repo_pr_result:
@@ -113,11 +97,15 @@
   when: _pr_status.stdout | length == 0
 
 # ── 4–12. Main Block ────────────────────────────────────────
+# Purpose: Groups related git-provider Cloud pull-request backend steps so shared rescue, cleanup, or
+#   conditional logic can be applied consistently.
 - name: "PR — Create or update automation PR"
   when: _pr_status.stdout | length > 0
   block:
 
     # ── 4. Parse repo URL ────────────────────────────────────
+    # Purpose: Reads existing state and converts it into facts without intentionally changing downstream
+    #   systems.
     - name: "PR — Parse repo URL"
       ansible.builtin.set_fact:
         _pr_url_path: >-
@@ -127,88 +115,106 @@
             else (git_repo_url | regex_replace('\.git$', '') | regex_replace('^https?://[^/]+/', ''))
           }}
 
+    # Purpose: Derives runtime facts from AAP inputs, global variables, registry data, or earlier task
+    #   output for later git-provider Cloud pull-request backend steps.
     - name: "PR — Resolve workspace and repo slug"
       ansible.builtin.set_fact:
         _pr_parts: "{{ _pr_url_path.split('/') | reject('equalto', '') | list }}"
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Set API identity"
       ansible.builtin.set_fact:
-        _pr_workspace: "{{ bitbucket_workspace | default('', true) or _pr_parts[0] }}"
-        _pr_repo: "{{ bitbucket_repo_slug | default('', true) or (_pr_parts[-1] | regex_replace('\\.git$', '')) }}"
-        _pr_api: "{{ bitbucket_cloud_api_url | default('https://api.bitbucket.org/2.0') | regex_replace('/$', '') }}"
+        _pr_workspace: "{{ git-provider_workspace | default('', true) or _pr_parts[0] }}"
+        _pr_repo: "{{ git-provider_repo_slug | default('', true) or (_pr_parts[-1] | regex_replace('\\.git$', '')) }}"
+        _pr_api: "{{ git-provider_cloud_api_url | default('https://api.git.example.lab/2.0') | regex_replace('/$', '') }}"
 
     # ── 5. Read Credentials ──────────────────────────────────
-    # Bitbucket Cloud API Tokens (ATATT3x...) use Basic auth:
+    # git-provider Cloud API Tokens (ATATT3x...) use Basic auth:
     #   Authorization: Basic base64(username:api_token)
-    # The username is your Bitbucket username (not email).
+    # The username is your git-provider username (not email).
+    # Purpose: Reads existing state and converts it into facts without intentionally changing downstream
+    #   systems.
     - name: "PR — Read credentials"
       ansible.builtin.set_fact:
         _pr_user: >-
           {{
-            lookup('ansible.builtin.env', 'BITBUCKET_USERNAME')
-            | default(lookup('ansible.builtin.env', 'BITBUCKET_USER'), true)
+            lookup('ansible.builtin.env', 'git-provider_USERNAME')
+            | default(lookup('ansible.builtin.env', 'git-provider_USER'), true)
           }}
-        _pr_token: >-  # pragma: allowlist secret
+        _pr_token: >-
           {{
-            lookup('ansible.builtin.env', 'BITBUCKET_TOKEN')
-            | default(lookup('ansible.builtin.env', 'BITBUCKET_CLOUD_TOKEN'), true)
+            lookup('ansible.builtin.env', 'git-provider_TOKEN')
+            | default(lookup('ansible.builtin.env', 'git-provider_CLOUD_TOKEN'), true)
           }}
 
+    # Purpose: Derives runtime facts from AAP inputs, global variables, registry data, or earlier task
+    #   output for later git-provider Cloud pull-request backend steps.
     - name: "PR — Build auth header"
       ansible.builtin.set_fact:
         _pr_auth:
           Authorization: "Basic {{ (_pr_user ~ ':' ~ _pr_token) | b64encode }}"
 
+    # Purpose: Fails early with a clear message when required git-provider Cloud pull-request backend inputs or
+    #   configuration are missing or inconsistent.
     - name: "PR — Validate credentials"
       ansible.builtin.assert:
         that:
           - _pr_user | length > 0
           - _pr_token | length > 0
-        fail_msg: "Set BITBUCKET_USERNAME and BITBUCKET_TOKEN in AAP."
+        fail_msg: "Set git-provider_USERNAME and git-provider_TOKEN in AAP."
 
     # ── 6. Find Existing PR ──────────────────────────────────
+    # Purpose: Derives runtime facts from AAP inputs, global variables, registry data, or earlier task
+    #   output for later git-provider Cloud pull-request backend steps.
     - name: "PR — Resolved API identity"
       ansible.builtin.debug:
         msg: "API: {{ _pr_api }}/repositories/{{ _pr_workspace }}/{{ _pr_repo }} | Token length: {{ _pr_token | length }}"
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Verify API token"
       ansible.builtin.uri:
         url: "{{ _pr_api }}/repositories/{{ _pr_workspace | urlencode }}/{{ _pr_repo | urlencode }}"
         method: GET
         headers: "{{ _pr_auth }}"
         return_content: false
-        validate_certs: "{{ bitbucket_validate_certs | default(true) }}"
+        validate_certs: "{{ git-provider_validate_certs | default(true) }}"
         status_code: [200, 404]
       register: _pr_api_check
       failed_when: false
 
+    # Purpose: Fails early with a clear message when required git-provider Cloud pull-request backend inputs or
+    #   configuration are missing or inconsistent.
     - name: "PR — Validate API access"
       ansible.builtin.assert:
         that:
           - _pr_api_check.status == 200
         fail_msg: >-
-          Bitbucket API check failed (HTTP {{ _pr_api_check.status | default('?') }}).
+          git-provider API check failed (HTTP {{ _pr_api_check.status | default('?') }}).
           URL: {{ _pr_api }}/repositories/{{ _pr_workspace }}/{{ _pr_repo }}.
           {% if _pr_api_check.status | default(0) == 401 %}Token is invalid or expired.
           {% elif _pr_api_check.status | default(0) == 403 %}Token lacks required permissions (need Repo Read + PR Write).
           {% elif _pr_api_check.status | default(0) == 404 %}Repository not found. Check workspace/repo slug.
           {% else %}Check AAP credential injection and token scopes.{% endif %}
 
+    # Purpose: Inspects existing state so the git-provider Cloud pull-request backend flow can decide whether
     - name: "PR — List open pull requests"
       ansible.builtin.uri:
         url: "{{ _pr_api }}/repositories/{{ _pr_workspace | urlencode }}/{{ _pr_repo | urlencode }}/pullrequests?state=OPEN&pagelen=50"
         method: GET
         headers: "{{ _pr_auth }}"
         return_content: true
-        validate_certs: "{{ bitbucket_validate_certs | default(true) }}"
+        validate_certs: "{{ git-provider_validate_certs | default(true) }}"
       register: _pr_list
 
+    # Purpose: Initializes or updates Ansible facts that later tasks in the git-provider Cloud pull-request
+    #   backend flow consume.
     - name: "PR — Initialize PR tracking"
       ansible.builtin.set_fact:
         _pr_existing_id: ""
         _pr_existing_branch: ""
         _pr_existing_url: ""
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Match existing automation PR"
       ansible.builtin.set_fact:
         _pr_existing_id: "{{ item.id | string }}"
@@ -220,6 +226,7 @@
         - item.destination.branch.name | default('') == target_branch
         - (item.source.branch.name | default('')) is match('^' ~ _pr_qmgr_branch_prefix)
 
+    # Purpose: Stops the workflow deliberately when a guard condition detects unsafe or unsupported state.
     - name: "PR — Stop create from reusing an existing queue manager PR"
       ansible.builtin.fail:
         msg: >-
@@ -234,12 +241,14 @@
         - _pr_existing_branch | length > 0
 
     # ── 7. Resolve Branch ────────────────────────────────────
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Set branch"
       ansible.builtin.set_fact:
         _pr_branch: "{{ _pr_existing_branch if _pr_existing_branch | length > 0 else _pr_qmgr_branch_prefix ~ 'qmgr' }}"
         _pr_is_update: "{{ _pr_existing_branch | length > 0 }}"
 
     # ── 8. Fetch Existing Branch ─────────────────────────────
+    # Purpose: Manipulates the local Git working copy used by the git-provider Cloud pull-request backend flow.
     - name: "PR — Fetch existing branch"
       ansible.builtin.command:
         argv: ["git", "fetch", "origin", "refs/heads/{{ _pr_branch }}:refs/remotes/origin/{{ _pr_branch }}"]
@@ -250,6 +259,7 @@
       when: _pr_is_update | bool
       check_mode: false
 
+    # Purpose: Manipulates the local Git working copy used by the git-provider Cloud pull-request backend flow.
     - name: "PR — Stash generated changes before branch reuse"
       ansible.builtin.command:
         argv: ["git", "stash", "push", "--include-untracked", "-m", "mq-nativeha-pr-update-{{ _pr_branch }}"]
@@ -260,6 +270,7 @@
       when: _pr_is_update | bool
       check_mode: false
 
+    # Purpose: Inspects existing state so the git-provider Cloud pull-request backend flow can decide whether
     - name: "PR — Checkout existing automation branch"
       ansible.builtin.command:
         argv: ["git", "checkout", "-B", "{{ _pr_branch }}", "refs/remotes/origin/{{ _pr_branch }}"]
@@ -269,6 +280,7 @@
       when: _pr_is_update | bool
       check_mode: false
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Reapply generated changes"
       ansible.builtin.command:
         argv: ["git", "stash", "pop"]
@@ -280,6 +292,7 @@
         - "'No local changes' not in (_pr_stash.stdout | default(''))"
       check_mode: false
 
+    # Purpose: Inspects existing state so the git-provider Cloud pull-request backend flow can decide whether
     - name: "PR — Checkout new automation branch"
       ansible.builtin.command:
         argv: ["git", "checkout", "-B", "{{ _pr_branch }}"]
@@ -289,6 +302,7 @@
       when: not _pr_is_update | bool
       check_mode: false
 
+    # Purpose: Manipulates the local Git working copy used by the git-provider Cloud pull-request backend flow.
     - name: "PR — Fetch base branch for root changelog restore"
       ansible.builtin.command:
         argv: ["git", "fetch", "origin", "refs/heads/{{ target_branch }}:refs/remotes/origin/{{ target_branch }}"]
@@ -298,6 +312,7 @@
       failed_when: false
       check_mode: false
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Restore root CHANGELOG.md from base branch"
       ansible.builtin.command:
         argv: ["git", "checkout", "refs/remotes/origin/{{ target_branch }}", "--", "CHANGELOG.md"]
@@ -307,12 +322,15 @@
       failed_when: false
       check_mode: false
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Ensure queue manager changelog directory exists"
       ansible.builtin.file:
         path: "{{ git_work_dir }}/{{ _pr_changelog_rel | dirname }}"
         state: directory
         mode: "0755"
 
+    # Purpose: Reads existing state and converts it into facts without intentionally changing downstream
+    #   systems.
     - name: "PR — Read current queue manager CHANGELOG.md"
       ansible.builtin.slurp:
         src: "{{ git_work_dir }}/{{ _pr_changelog_rel }}"
@@ -320,11 +338,14 @@
       failed_when: false
       changed_when: false
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Prepare current changelog text"
       ansible.builtin.set_fact:
         _pr_cl_text: >-
           {{ _pr_cl_raw_current.content | default('') | b64decode }}
 
+    # Purpose: Reads existing state and converts it into facts without intentionally changing downstream
+    #   systems.
     - name: "PR — Parse current queue manager changelog version"
       ansible.builtin.set_fact:
         _pr_cl_heading: >-
@@ -333,6 +354,8 @@
             | default('')
           }}
 
+    # Purpose: Converts caller input into canonical runtime facts used by later git-provider Cloud pull-request
+    #   backend tasks.
     - name: "PR — Normalize current queue manager changelog version"
       ansible.builtin.set_fact:
         _pr_cl_latest_version: >-
@@ -341,6 +364,8 @@
             if _pr_cl_heading | length > 0 else ''
           }}
 
+    # Purpose: Derives runtime facts from AAP inputs, global variables, registry data, or earlier task
+    #   output for later git-provider Cloud pull-request backend steps.
     - name: "PR — Compute queue manager changelog version"
       ansible.builtin.set_fact:
         _pr_ver: >-
@@ -353,6 +378,8 @@
       vars:
         _pr_cl_version_parts: "{{ _pr_cl_latest_version.split('.') }}"
 
+    # Purpose: Converts caller input into canonical runtime facts used by later git-provider Cloud pull-request
+    #   backend tasks.
     - name: "PR — Normalize optional manager metadata"
       ansible.builtin.set_fact:
         _pr_namespace: "{{ vars.get('namespace', '') }}"
@@ -366,6 +393,7 @@
           }}
 
     # ── 9. Write queue manager CHANGELOG.md ─────────────────
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Write queue manager CHANGELOG.md"
       ansible.builtin.copy:
         dest: "{{ git_work_dir }}/{{ _pr_changelog_rel }}"
@@ -433,10 +461,12 @@
           {% endif %}
 
     # ── 10. Git Commit & Push ────────────────────────────────
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Prepare title"
       ansible.builtin.set_fact:
         _pr_title: "[{{ env_upper }}] {{ target_repo_pr_action_label }} {{ _pr_title_subject }}"
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Prepare manager description"
       ansible.builtin.set_fact:
         _pr_description: |
@@ -494,6 +524,7 @@
 
           Manual approval is required. Automation creates or updates this pull request but does not merge it.
 
+    # Purpose: Publishes validated generated changes back to the target Git repository.
     - name: "PR — Stage all changes"
       ansible.builtin.command:
         argv: ["git", "add", "-A"]
@@ -502,6 +533,7 @@
       changed_when: false
       check_mode: false
 
+    # Purpose: Publishes validated generated changes back to the target Git repository.
     - name: "PR — Commit"
       ansible.builtin.command:
         argv: ["git", "commit", "-m", "{{ _pr_title }}"]
@@ -510,6 +542,7 @@
       changed_when: true
       check_mode: false
 
+    # Purpose: Manipulates the local Git working copy used by the git-provider Cloud pull-request backend flow.
     - name: "PR — Rebase existing branch before push"
       ansible.builtin.command:
         argv: ["git", "pull", "--rebase", "origin", "{{ _pr_branch }}"]
@@ -519,6 +552,7 @@
       when: _pr_is_update | bool
       check_mode: false
 
+    # Purpose: Publishes validated generated changes back to the target Git repository.
     - name: "PR — Push"
       ansible.builtin.command:
         argv: ["git", "push", "origin", "HEAD:refs/heads/{{ _pr_branch }}"]
@@ -529,6 +563,7 @@
       failed_when: false
       check_mode: false
 
+    # Purpose: Stops the workflow deliberately when a guard condition detects unsafe or unsupported state.
     - name: "PR — Fail on push rejection"
       ansible.builtin.fail:
         msg: >-
@@ -538,22 +573,26 @@
           {{ (_pr_push.stderr | default('') ~ ' ' ~ _pr_push.stdout | default('')) | trim }}
       when: _pr_push.rc != 0
 
+    # Purpose: Inspects existing state so the git-provider Cloud pull-request backend flow can decide whether
     - name: "PR — Recheck open pull requests before create"
       ansible.builtin.uri:
         url: "{{ _pr_api }}/repositories/{{ _pr_workspace | urlencode }}/{{ _pr_repo | urlencode }}/pullrequests?state=OPEN&pagelen=50"
         method: GET
         headers: "{{ _pr_auth }}"
         return_content: true
-        validate_certs: "{{ bitbucket_validate_certs | default(true) }}"
+        validate_certs: "{{ git-provider_validate_certs | default(true) }}"
       register: _pr_late_list
       when: not _pr_is_update | bool
 
+    # Purpose: Initializes or updates Ansible facts that later tasks in the git-provider Cloud pull-request
+    #   backend flow consume.
     - name: "PR — Initialize late duplicate tracking"
       ansible.builtin.set_fact:
         _pr_late_existing_id: ""
         _pr_late_existing_branch: ""
       when: not _pr_is_update | bool
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Detect same queue manager PR created during this run"
       ansible.builtin.set_fact:
         _pr_late_existing_id: "{{ item.id | string }}"
@@ -565,6 +604,7 @@
         - item.destination.branch.name | default('') == target_branch
         - (item.source.branch.name | default('')) is match('^' ~ _pr_qmgr_branch_prefix)
 
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Remove duplicate branch created by this run"
       ansible.builtin.command:
         argv: ["git", "push", "origin", ":refs/heads/{{ _pr_branch }}"]
@@ -578,6 +618,7 @@
         - _pr_late_existing_branch != _pr_branch
       check_mode: false
 
+    # Purpose: Stops the workflow deliberately when a guard condition detects unsafe or unsupported state.
     - name: "PR — Stop duplicate queue manager PR creation"
       ansible.builtin.fail:
         msg: >-
@@ -591,6 +632,7 @@
         - _pr_late_existing_branch | length > 0
 
     # ── 11. Create/Update Pull Request ───────────────────────
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Create or update pull request"
       ansible.builtin.uri:
         url: >-
@@ -615,10 +657,11 @@
           close_source_branch: true
         return_content: true
         status_code: [200, 201]
-        validate_certs: "{{ bitbucket_validate_certs | default(true) }}"
+        validate_certs: "{{ git-provider_validate_certs | default(true) }}"
       register: _pr_resp
 
     # ── 12. Store Result ─────────────────────────────────────
+    # Purpose: Builds, updates, or records pull-request state for the target repository change.
     - name: "PR — Store result"
       ansible.builtin.set_fact:
         target_repo_pr_result:
@@ -632,11 +675,13 @@
           pull_request_url: "{{ _pr_resp.json.links.html.href | default(_pr_existing_url, true) }}"
 
 # ── Display ─────────────────────────────────────────────────
+# Purpose: Builds, updates, or records pull-request state for the target repository change.
 - name: "PR — No changes"
   ansible.builtin.debug:
     msg: "{{ target_repo_pr_result.reason }}"
   when: not target_repo_pr_result.changed | bool
 
+# Purpose: Builds, updates, or records pull-request state for the target repository change.
 - name: "PR — Done"  # noqa no-handler
   ansible.builtin.debug:
     msg:

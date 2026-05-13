@@ -1,0 +1,28 @@
+---
+# Add or update one public client/signer certificate bundle trusted by one
+# NativeHA QueueManager.
+
+# Purpose: Turn the requested queue manager scope into an exact target list.
+- name: "Client trust - Resolve queue manager target"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/resolve_targets.yaml"
+
+# Purpose: Require one explicit queue manager.
+- name: "Client trust - Require one explicit queue manager"
+  ansible.builtin.assert:
+    that:
+      - not qmgr_select_all | bool
+      - cert_targets | length == 1
+    fail_msg: >-
+      Client/signer trust certificate add requires exactly one qmgr_name.
+      Do not use blank, all, or a comma-separated list for this playbook.
+    quiet: true
+
+# Purpose: Resolve the single queue manager target for client trust add.
+- name: "Client trust - Select target"
+  ansible.builtin.set_fact:
+    cert_target: "{{ cert_targets | first }}"
+  no_log: true
+
+# Purpose: Add the supplied public certificate to the selected queue manager trust source.
+- name: "Client trust - Process target"
+  ansible.builtin.include_tasks: process_target.yaml

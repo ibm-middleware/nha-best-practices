@@ -1,0 +1,33 @@
+{#
+  JSON 6902 patch that appends app-specific MQSC ConfigMap references.
+  Connects generated app MQSC ConfigMaps from
+  overlays/_shared/mqsc-app/<group> to spec.queueManager.mqsc in the
+  QueueManager CR when app_mqsc_apply_strategy=restart.
+  qmgr onboarding discovery: app_mqsc_groups with group suffix, directory,
+  and file names.
+  qmgr onboarding facts: qmgr_name.
+  overlays/_shared/patches/mqsc-app-refs.yaml.
+#}
+---
+# mqsc-app-refs.yaml - JSON 6902 patch for app MQSC ConfigMap references
+# Generated at onboarding from app MQSC placeholder files. Day-2 app MQSC
+# automation updates the files under overlays/_shared/mqsc-app/<group>/.
+{#
+Section:
+  One patch entry is emitted per discovered app MQSC group.
+#}
+{% for group in app_mqsc_groups | default([]) %}
+- op: add
+  path: /spec/queueManager/mqsc/-
+  value:
+    configMap:
+      name: {{ qmgr_name }}-mqsc-{{ group.suffix }}
+      items:
+{#
+Section:
+  Each file in the group becomes one QueueManager mqsc item.
+#}
+{% for file in group.files %}
+        - {{ file }}
+{% endfor %}
+{% endfor %}

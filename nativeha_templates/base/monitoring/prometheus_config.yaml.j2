@@ -1,3 +1,10 @@
+{#
+  ConfigMap containing mq_prometheus exporter configuration.
+  Defines how the exporter connects to the queue manager and which MQ objects
+  it should expose as metrics.
+  qmgr onboarding facts: qmgr_name, qmgr_name_upper, namespace.
+  base/monitoring/prometheus_config.yaml.
+#}
 ---
 # ConfigMap for MQ Prometheus exporter configuration
 apiVersion: v1

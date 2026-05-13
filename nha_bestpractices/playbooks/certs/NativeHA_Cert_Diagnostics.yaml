@@ -1,0 +1,69 @@
+---
+# Purpose: Collect certificate details for the requested queue manager scope.
+- name: "NativeHA Certificate Diagnostics"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+    - ../../../nativeha_templates/global_vars/certs_control_vars.yaml
+
+  tasks:
+    # Purpose: Collect certificate details for the requested queue manager scope.
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    # Purpose: Collect certificate details for the requested queue manager scope.
+    - name: "Run certificate diagnostics workflow"
+      block:
+        # Purpose: Collect certificate details for the requested queue manager scope.
+        - name: "Certificate diagnostics - Execute"
+          ansible.builtin.include_role:
+            name: cert_diagnostics
+
+        # Purpose: Collect certificate details for the requested queue manager scope.
+        - name: "Certificate diagnostics - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        # Purpose: Collect certificate details for the requested queue manager scope.
+        - name: "Certificate diagnostics - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+        # Purpose: Show the failed diagnostic step in the final report.
+        - name: "Certificate diagnostics - Record failed diagnostic summary"
+          ansible.builtin.set_fact:
+            nativeha_report_diagnostic_results: >-
+              {{
+                nativeha_report_diagnostic_results | default([])
+                + [
+                  {
+                    'mode': diagnostic_mode | default('unknown', true) | string | lower | trim,
+                    'target': qmgr_name | default(app_sys_id | default('diagnostics', true), true) | upper,
+                    'check': nativeha_failed_task_name | default('diagnostic task'),
+                    'status': 'failed',
+                    'detail': nativeha_playbook_error | default('Diagnostic task failed.')
+                  }
+                ]
+              }}
+
+      always:
+        # Purpose: Collect certificate details for the requested queue manager scope.
+        - name: "Certificate diagnostics - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Certificate Diagnostics"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Run focused certificate diagnostics for samplecertca, OpenShift, samplecertrepo,
+              CSR generation, or registry reporting.
+
+        # Purpose: Collect certificate details for the requested queue manager scope.
+        - name: "Certificate diagnostics - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Certificate diagnostics failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

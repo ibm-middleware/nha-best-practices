@@ -1,0 +1,5 @@
+---
+final_report_status: "success"
+final_report_title: "{{ ansible_play_name | default('MQ NativeHA Automation') }}"
+final_report_summary: "{{ target_repo_pr_summary | default('Automation run completed.') }}"
+final_report_error: ""

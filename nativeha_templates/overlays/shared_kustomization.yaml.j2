@@ -1,0 +1,66 @@
+{#
+  Shared overlay Kustomization consumed by every regional overlay.
+  Holds queue-manager-wide mutable state that must stay identical in all
+  regions, such as image patches, sizing patches, and app MQSC ConfigMaps.
+  App MQSC uses fixed ConfigMap names so object onboarding does not trigger
+  an automatic QueueManager spec change or hash-driven rollout.
+  qmgr onboarding facts: namespace, qmgr_name, app_mqsc_groups.
+  overlays/_shared/kustomization.yaml.
+#}
+{% set _app_mqsc_apply_strategy = app_mqsc_apply_strategy | default('restart') | lower | trim %}
+---
+# overlays/_shared/kustomization.yaml - Queue-manager-wide mutable layer
+# This layer is consumed by every regional overlay. Keep day-2 state that must
+# be identical in use/cluster2 here, such as MQ image, sizing, and app MQSC
+# ConfigMaps. Client/signer public trust items are also owned here; PEM data
+# stays in the <qmgr>-client-certs OpenShift Secret for direct mode, or in the
+# shared samplecertrepo path when VSO sync is enabled.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: {{ namespace }}
+resources:
+  - ../../base
+configurations:
+  - kustomizeconfig.yaml
+patches:
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: patches/qm-image-patch.yaml
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: patches/qm-sizing-patch.yaml
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: patches/qm-client-trust-patch.yaml
+{#
+Section:
+  App MQSC patch and ConfigMap generators are emitted only when app MQSC groups
+  were discovered during onboarding.
+#}
+{% if app_mqsc_groups | default([]) | length > 0 %}
+{% if _app_mqsc_apply_strategy == 'restart' %}
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: patches/mqsc-app-refs.yaml
+{% endif %}
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+{#
+Section:
+  Each app MQSC group gets one generated ConfigMap with a stable name. In
+  restart mode the companion mqsc-app-refs patch attaches it to
+  spec.queueManager.mqsc; in manual mode scripts/jobs can apply it explicitly.
+#}
+{% for group in app_mqsc_groups %}
+  - name: {{ qmgr_name }}-mqsc-{{ group.suffix }}
+    files:
+{% for file in group.files %}
+      - mqsc-app/{{ group.dir }}/{{ file }}
+{% endfor %}
+{% endfor %}
+{% endif %}

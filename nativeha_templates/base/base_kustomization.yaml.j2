@@ -1,5 +1,18 @@
+{#
+  Base Kustomization for a generated queue manager directory.
+  Groups immutable base resources, core MQSC files, INI files, optional
+  utility scripts, secrets, and optional monitoring into the base layer.
+  qmgr onboarding facts: namespace, qmgr_name, mqsc_core_files, ini_files,
+  script_files.
+  qmgr onboarding facts/global_vars: mq_prometheus_exporter_enabled,
+  mq_webui_enabled, enable_prometheus_monitor, enable_webui,
+  enable_scripts_configmap.
+  queue_managers/<env>/<qmgr>/base/kustomization.yaml.
+#}
+{% set _prometheus_enabled = mq_prometheus_exporter_enabled | default(enable_prometheus_monitor | default(false)) | bool %}
+{% set _webui_enabled = mq_webui_enabled | default(enable_webui | default(web_enabled | default(false))) | bool %}
 ---
-# base/kustomization.yaml — Base layer for queue manager
+# base/kustomization.yaml - Base layer for queue manager
 # Contains all shared resources that are common across regions.
 # This kustomization is referenced by each overlay's kustomization.
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -12,15 +25,18 @@ labels:
 resources:
   - qmgr.yaml
   - secrets
-{% if enable_prometheus_monitor | default(true) | bool or enable_webui | default(true) | bool %}
+{% if _prometheus_enabled or _webui_enabled %}
   - monitoring
+{% endif %}
+{% if custom_client_route_enabled | default(false) | bool %}
+  - routes
 {% endif %}
 generatorOptions:
   disableNameSuffixHash: true
 configMapGenerator:
   - name: {{ qmgr_name }}-mqsc
     files:
-{% for file in mqsc_files %}
+{% for file in mqsc_core_files %}
       - mqsc/{{ file }}
 {% endfor %}
   - name: {{ qmgr_name }}-ini

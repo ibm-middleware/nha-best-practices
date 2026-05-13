@@ -1,0 +1,243 @@
+---
+# Purpose: Validate create inputs, run workflow.yaml, report failures, and clean the temporary Git checkout.
+# Keep queue manager generation and publish preparation in workflow.yaml.
+
+# Purpose: Force onboarding to create-only mode.
+- name: "Step 0 - Set create-only action"
+  ansible.builtin.set_fact:
+    qm_action_effective: "Create"
+
+# Purpose: Start an empty list so all validation problems can be reported together.
+- name: "Step 0 - Initialize validation errors"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: []
+
+# Purpose: Trim the optional namespace override before validating its Kubernetes name.
+- name: "Step 0 - Normalize optional custom OpenShift namespace"
+  ansible.builtin.set_fact:
+    custom_openshift_namespace_effective: "{{ custom_openshift_namespace | default('', true) | string | trim }}"
+    custom_openshift_namespace_enabled: "{{ custom_openshift_namespace | default('', true) | string | trim | length > 0 }}"
+
+# Purpose: Add a validation message when the custom OpenShift namespace is not a valid Kubernetes name.
+- name: "Step 0 - Record invalid custom OpenShift namespace"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: >-
+      {{ _qmgr_onboard_input_errors + [
+        'custom_openshift_namespace="' ~ custom_openshift_namespace_effective
+        ~ '" is invalid. It must be a Kubernetes/OpenShift namespace name: '
+        ~ 'lowercase letters, digits, hyphens, start and end with a letter or '
+        ~ 'digit, and no more than 63 characters.'
+      ] }}
+  when:
+    - custom_openshift_namespace_enabled | bool
+    - >-
+      custom_openshift_namespace_effective | length > 63
+      or custom_openshift_namespace_effective is not match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+
+# Purpose: Add a validation message for unsupported action input.
+- name: "Step 0 - Record unsupported action input"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: >-
+      {{ _qmgr_onboard_input_errors + [
+        'qm_action was supplied as "' ~ (qm_action | string | trim) ~ '". Queue manager onboarding is create-only; remove qm_action from the survey.'
+      ] }}
+  when: qm_action | default('', true) | string | trim | length > 0
+
+# Purpose: Add a validation message when the user supplies queue manager name.
+- name: "Step 0 - Record supplied qmgr_name"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: >-
+      {{ _qmgr_onboard_input_errors + [
+        'qmgr_name was supplied as "' ~ (qmgr_name | string | trim)
+        ~ '". Create derives qmgr_name from app_sys_id, mq_environment, '
+        ~ 'and the next free Git sequence; remove qmgr_name from the survey.'
+      ] }}
+  when: qmgr_name | default('', true) | string | trim | length > 0
+
+# Purpose: Add a validation message for invalid app sys id.
+- name: "Step 0 - Record invalid app_sys_id"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: >-
+      {{ _qmgr_onboard_input_errors + [
+        'app_sys_id must be exactly 3 lowercase/uppercase letters or digits '
+        ~ 'after normalization, for example DMQ. Got "'
+        ~ (app_sys_id | default('missing', true) | string) ~ '".'
+      ] }}
+  when: app_sys_id | default('', true) | lower | trim is not match('^[a-z0-9]{3}$')
+
+# Purpose: Add a validation message for missing environment.
+- name: "Step 0 - Record missing environment"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: "{{ _qmgr_onboard_input_errors + ['mq_environment is required. Use one of: DEV, QA1, QA2, QA3, PROD.'] }}"
+  when: mq_environment | default('', true) | string | trim | length == 0
+
+# Purpose: Add a validation message for unsupported environment.
+- name: "Step 0 - Record unsupported environment"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: >-
+      {{ _qmgr_onboard_input_errors + [
+        'mq_environment="' ~ _qmgr_onboard_env ~ '" is not supported. Use one of: DEV, QA1, QA2, QA3, PROD.'
+      ] }}
+  vars:
+    _qmgr_onboard_env: "{{ mq_environment | default('', true) | string | upper | trim }}"
+  when:
+    - _qmgr_onboard_env | length > 0
+    - _qmgr_onboard_env not in ['DEV', 'QA1', 'QA2', 'QA3', 'PROD']
+
+# Purpose: Add a validation message for missing environment map entries.
+- name: "Step 0 - Record missing environment map entries"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: >-
+      {{ _qmgr_onboard_input_errors + [
+        'mq_environment="' ~ _qmgr_onboard_env ~ '" is missing from ' ~ item.key ~ ' in nativeha_qmgr_control_vars.yaml.'
+      ] }}
+  vars:
+    _qmgr_onboard_env: "{{ mq_environment | default('', true) | string | upper | trim }}"
+    _qmgr_onboard_env_maps:
+      env_repo_map: "{{ env_repo_map.keys() | list }}"
+      env_branch_map: "{{ env_branch_map.keys() | list }}"
+      env_qmgr_abbr: "{{ env_qmgr_abbr.keys() | list }}"
+      env_namespace_abbr: "{{ env_namespace_abbr.keys() | list }}"
+      env_instance_type_map: "{{ env_instance_type_map.keys() | list }}"
+      env_region_map: "{{ env_region_map.keys() | list }}"
+      openshift_clusters: "{{ openshift_clusters.keys() | list }}"
+      sizing: "{{ sizing.keys() | list }}"
+  loop: "{{ _qmgr_onboard_env_maps | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - _qmgr_onboard_env in ['DEV', 'QA1', 'QA2', 'QA3', 'PROD']
+    - _qmgr_onboard_env not in item.value
+
+# Purpose: Add a validation message for missing sizing inputs.
+- name: "Step 0 - Record missing sizing inputs"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: >-
+      {{ _qmgr_onboard_input_errors + [
+        item.name ~ ' is required and must be a positive value. Example total_volume_24h=1m, avg_msg_size=4k.'
+      ] }}
+  loop:
+    - name: total_volume_24h
+      value: "{{ total_volume_24h | default('', true) }}"
+    - name: avg_msg_size
+      value: "{{ avg_msg_size | default('', true) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.value | string | trim | length == 0
+
+# Purpose: Convert human sizing inputs into numbers for tier selection.
+- name: "Step 0 - Parse sizing inputs for early validation"
+  when:
+    - total_volume_24h | default('', true) | string | trim | length > 0
+    - avg_msg_size | default('', true) | string | trim | length > 0
+  block:
+    # Purpose: Convert human sizing inputs into numbers for tier selection.
+    - name: "Step 0 - Parse total volume and average message size"
+      ansible.builtin.set_fact:
+        _qmgr_onboard_parsed_volume: "{{ total_volume_24h | parse_volume_count | int }}"
+        _qmgr_onboard_parsed_size: "{{ avg_msg_size | human_to_bytes | int }}"
+
+  rescue:
+    # Purpose: Add a validation message when sizing values cannot be parsed.
+    - name: "Step 0 - Record unparsable sizing inputs"
+      ansible.builtin.set_fact:
+        _qmgr_onboard_input_errors: >-
+          {{ _qmgr_onboard_input_errors + [
+            'Sizing inputs could not be parsed. Use total_volume_24h as a '
+            ~ 'message count such as 1k, 500k, or 1m, and avg_msg_size as a '
+            ~ 'byte size such as 4k, 1m, or 10m. Received total_volume_24h="' ~
+            (total_volume_24h | default('missing', true) | string) ~ '", avg_msg_size="' ~
+            (avg_msg_size | default('missing', true) | string) ~ '". Parser detail: ' ~
+            (ansible_failed_result.msg | default('no parser detail returned') | string)
+          ] }}
+
+# Purpose: Add a validation message when parsed sizing values are zero or negative.
+- name: "Step 0 - Record non-positive sizing inputs"
+  ansible.builtin.set_fact:
+    _qmgr_onboard_input_errors: >-
+      {{ _qmgr_onboard_input_errors + [
+        'Sizing inputs must be positive. Received total_volume_24h="' ~
+        (total_volume_24h | string) ~ '" parsed=' ~ (_qmgr_onboard_parsed_volume | string) ~
+        ', avg_msg_size="' ~ (avg_msg_size | string) ~ '" parsed=' ~
+        (_qmgr_onboard_parsed_size | string) ~ '.'
+      ] }}
+  when:
+    - _qmgr_onboard_parsed_volume is defined
+    - _qmgr_onboard_parsed_size is defined
+    - (_qmgr_onboard_parsed_volume | int <= 0) or (_qmgr_onboard_parsed_size | int <= 0)
+
+# Purpose: Stop before any change and print the validation errors collected above.
+- name: "Step 0 - Fail with validation reasons"
+  ansible.builtin.fail:
+    msg: |-
+      Queue manager onboarding input validation failed.
+
+      {% for issue in _qmgr_onboard_input_errors %}
+      - {{ issue }}
+      {% endfor %}
+
+      No Git repository was cloned and no queue-manager files were created.
+  when: _qmgr_onboard_input_errors | length > 0
+
+# Purpose: Group the work so failures are reported and the temporary Git workspace is removed.
+- name: "Onboarding - Execute with guaranteed workspace cleanup"
+  block:
+
+    # Purpose: Hand off to the detailed workflow after the input checks pass.
+    - name: "Onboarding - Run workflow (workflow.yaml)"
+      ansible.builtin.include_tasks: workflow.yaml
+
+  rescue:
+
+    # Purpose: Save the real failure detail before the final report is built.
+    - name: "Rescue - Capture onboarding failure detail"
+      ansible.builtin.set_fact:
+        _qmgr_onboard_failure_detail: >-
+          {{
+            ansible_failed_result.msg
+            | default(
+                ansible_failed_result.stderr
+                | default('Queue manager onboarding failed before a detailed cause was returned.')
+              )
+            | string
+            | regex_replace('\n{3,}', '\n\n')
+            | trim
+          }}
+
+    # Purpose: Print the captured failure detail in the job log.
+    - name: "Rescue - Log onboarding failure"
+      ansible.builtin.debug:
+        msg:
+          - "ONBOARDING FAILED"
+          - "  Action      : CREATE"
+          - "  QMgr        : {{ qmgr_name | default('not yet derived') | upper }}"
+          - "  Environment : {{ mq_environment | upper }}"
+          - "  Branch      : {{ target_branch | default('not yet set') }}"
+          - "  Root Cause  : {{ _qmgr_onboard_failure_detail }}"
+
+    # Purpose: End the AAP job as failed after reporting the original problem.
+    - name: "Rescue - Re-raise to mark the job as failed in AAP"
+      ansible.builtin.fail:
+        msg: |-
+          Queue manager onboarding failed.
+
+          {{ _qmgr_onboard_failure_detail }}
+
+  always:
+    # Purpose: Release the direct publish lock before removing the temporary checkout.
+    - name: "Always - Release direct publish lock"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: direct_publish_lock_release
+      when: _direct_publish_lock_acquired | default(false) | bool
+
+    # Purpose: Remove temporary files created during this run.
+    - name: "Always - Remove git working directory"
+      ansible.builtin.file:
+        path: "{{ git_work_dir }}"
+        state: absent
+      when:
+        - git_work_dir is defined
+        - git_work_dir_base is defined
+        - git_work_dir != git_work_dir_base
+      check_mode: false

@@ -1,0 +1,43 @@
+---
+# Release the remote Git lock created by direct_publish_lock_acquire.yaml.
+
+- name: "Direct publish lock - Release remote branch"
+  ansible.builtin.command:
+    argv:
+      - git
+      - push
+      - "--force-with-lease=refs/heads/{{ _direct_publish_lock_branch }}:{{ _direct_publish_lock_sha | default('') }}"
+      - origin
+      - ":refs/heads/{{ _direct_publish_lock_branch }}"
+  args:
+    chdir: "{{ git_work_dir }}"
+  register: _direct_publish_lock_release
+  changed_when: _direct_publish_lock_release.rc == 0
+  failed_when: false
+  check_mode: false
+  when:
+    - _direct_publish_lock_acquired | default(false) | bool
+    - _direct_publish_lock_branch | default('', true) | length > 0
+
+- name: "Direct publish lock - Report release issue"
+  ansible.builtin.debug:
+    msg: >-
+      Direct publish lock {{ _direct_publish_lock_branch }} could not be
+      released automatically. Delete that lock branch after confirming no direct
+      publish job is still running. Git output: {{
+      (_direct_publish_lock_release.stderr | default('') ~ ' ' ~
+       _direct_publish_lock_release.stdout | default('')) | trim
+      }}
+  when:
+    - _direct_publish_lock_acquired | default(false) | bool
+    - _direct_publish_lock_release is defined
+    - _direct_publish_lock_release.rc != 0
+
+- name: "Direct publish lock - Clear local lock facts"
+  ansible.builtin.set_fact:
+    _direct_publish_lock_acquired: false
+    _direct_publish_lock_branch: ""
+    _direct_publish_lock_sha: ""
+  when:
+    - _direct_publish_lock_acquired | default(false) | bool
+    - _direct_publish_lock_release is not defined or _direct_publish_lock_release.rc == 0

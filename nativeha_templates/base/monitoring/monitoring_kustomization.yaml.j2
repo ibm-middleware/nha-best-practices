@@ -1,15 +1,26 @@
+{#
+  Kustomization for optional monitoring and WebUI support resources.
+  Adds Prometheus exporter resources and/or MQ WebUI config only when the
+  corresponding feature flags are enabled.
+  qmgr onboarding facts: qmgr_name.
+  qmgr onboarding facts/global_vars: mq_prometheus_exporter_enabled,
+  mq_webui_enabled, enable_prometheus_monitor, enable_webui.
+  base/monitoring/kustomization.yaml.
+#}
+{% set _prometheus_enabled = mq_prometheus_exporter_enabled | default(enable_prometheus_monitor | default(false)) | bool %}
+{% set _webui_enabled = mq_webui_enabled | default(enable_webui | default(web_enabled | default(false))) | bool %}
 ---
-# base/monitoring/kustomization.yaml — Monitoring & WebUI resources
+# base/monitoring/kustomization.yaml - Monitoring & WebUI resources
 # Conditionally includes Prometheus exporter and MQ WebUI ConfigMap.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-{% if enable_prometheus_monitor | default(true) | bool %}
+{% if _prometheus_enabled %}
 resources:
   - prometheus_config.yaml
   - prometheus_deployment.yaml
   - prometheus_service.yaml
 {% endif %}
-{% if enable_webui | default(true) | bool %}
+{% if _webui_enabled %}
 generatorOptions:
   disableNameSuffixHash: true
 configMapGenerator:

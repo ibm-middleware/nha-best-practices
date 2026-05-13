@@ -1,0 +1,49 @@
+---
+# Purpose: Choose samplecertrepo path for {{ cert_type }} from inputs and defaults.
+- name: "Diagnostics - Resolve samplecertrepo path for {{ cert_type }}"
+  ansible.builtin.set_fact:
+    _samplecertrepo_cert_path: "{{ samplecertrepo_cert_base_path }}/{{ cert_type_samplecertrepo_subpath[cert_type] }}"
+
+# Purpose: Read existing samplecertrepo certificate data for comparison or diagnostics.
+- name: "Diagnostics - Read samplecertrepo KV for {{ cert_type }}"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/samplecertrepo_read.yaml"
+
+# Purpose: Read certificate details needed for lifecycle decisions and reporting.
+- name: "Diagnostics - samplecertrepo read result for {{ cert_type }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ cert_type }} at {{ samplecertrepo_cert_mount_point }}/{{ _samplecertrepo_cert_path }}:
+      {{ 'found' if (
+           not (_samplecertrepo_read.failed | default(false))
+           and (_samplecertrepo_read.data is defined)
+           and (_samplecertrepo_read.data.data is defined)
+           and (_samplecertrepo_read.data.data['tls.crt'] is defined)
+         ) else 'missing or unreadable' }}
+
+# Purpose: Store samplecertrepo certificate read diagnostics for the final report.
+- name: "Diagnostics - Record samplecertrepo read result for {{ cert_type }}"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'qmgr_name': qmgr_name,
+            'namespace': namespace,
+            'target': qmgr_name | upper,
+            'check': 'samplecertrepo cert read: ' ~ cert_type,
+            'status': (
+              'passed'
+              if (
+                not (_samplecertrepo_read.failed | default(false))
+                and (_samplecertrepo_read.data is defined)
+                and (_samplecertrepo_read.data.data is defined)
+                and (_samplecertrepo_read.data.data['tls.crt'] is defined)
+              )
+              else 'attention'
+            ),
+            'detail': samplecertrepo_cert_mount_point ~ '/' ~ _samplecertrepo_cert_path
+          }
+        ]
+      }}

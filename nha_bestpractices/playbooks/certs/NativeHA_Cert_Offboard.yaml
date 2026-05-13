@@ -1,0 +1,52 @@
+---
+# Purpose: Remove selected certificates from their backend and report what was removed.
+- name: "NativeHA Certificate Offboard"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+    - ../../../nativeha_templates/global_vars/certs_control_vars.yaml
+
+  tasks:
+    # Purpose: Remove selected certificates from their backend and report what was removed.
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    # Purpose: Remove selected certificates from their backend and report what was removed.
+    - name: "Run certificate offboard workflow"
+      block:
+        # Purpose: Remove selected certificates from their backend and report what was removed.
+        - name: "Certificate offboard - Execute"
+          ansible.builtin.include_role:
+            name: cert_offboard
+
+        # Purpose: Remove selected certificates from their backend and report what was removed.
+        - name: "Certificate offboard - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        # Purpose: Remove selected certificates from their backend and report what was removed.
+        - name: "Certificate offboard - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        # Purpose: Remove selected certificates from their backend and report what was removed.
+        - name: "Certificate offboard - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Certificate Offboard"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Remove NativeHA certificate material from the configured backend,
+              retire the certificate records, and update the registry.
+
+        # Purpose: Remove selected certificates from their backend and report what was removed.
+        - name: "Certificate offboard - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Certificate offboard failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

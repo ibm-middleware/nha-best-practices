@@ -1,0 +1,175 @@
+---
+# Pluggable diagnostics for individual certificate-management functions.
+
+# Purpose: Normalize diagnostics inputs and initialize report rows.
+- name: "Diagnostics - Normalize inputs"
+  ansible.builtin.set_fact:
+    diagnostic_mode_effective: "{{ diagnostic_mode | default('', true) | string | lower | trim }}"
+    nativeha_report_diagnostic_results: []
+
+# Purpose: Make sure diagnostics mode is one of the supported choices.
+- name: "Diagnostics - Validate mode"
+  ansible.builtin.assert:
+    that:
+      - diagnostic_mode_effective | default('', true) | length > 0
+      - diagnostic_mode_effective in _diagnostic_modes
+    fail_msg: >-
+      diagnostic_mode is required. Supported modes:
+      {{ _diagnostic_modes | join(', ') }}.
+    quiet: true
+  vars:
+    _diagnostic_modes:
+      - samplecertca_connectivity
+      - samplecertca_cert_status
+      - samplecertca_get_root_certs
+      - csr_generate
+      - openshift_connectivity
+      - openshift_namespace_check
+      - openshift_secret_read
+      - samplecertrepo_connectivity
+      - samplecertrepo_cert_read
+      - registry_report
+
+# Purpose: Check backend connectivity before running live certificate diagnostics.
+- name: "Diagnostics - samplecertca connectivity"
+  when: diagnostic_mode_effective == 'samplecertca_connectivity'
+  block:
+    # Purpose: Stop early if samplecertca connection settings are incomplete.
+    - name: "Diagnostics - Validate samplecertca settings"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/validate_samplecertca_config.yaml"
+
+    # Purpose: Get a samplecertca token before live certificate operations.
+    - name: "Diagnostics - Authenticate to samplecertca"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/samplecertca_auth.yaml"
+
+    # Purpose: Check backend connectivity before running live certificate diagnostics.
+    - name: "Diagnostics - samplecertca connectivity passed"
+      ansible.builtin.debug:
+        msg: "samplecertca authentication succeeded for {{ samplecertca_url }}."
+
+    # Purpose: Store samplecertca connectivity diagnostics for the final report.
+    - name: "Diagnostics - Record samplecertca connectivity result"
+      ansible.builtin.set_fact:
+        nativeha_report_diagnostic_results: >-
+          {{
+            nativeha_report_diagnostic_results | default([])
+            + [
+              {
+                'mode': diagnostic_mode_effective,
+                'target': 'samplecertca',
+                'check': 'authentication',
+                'status': 'passed',
+                'detail': 'Authenticated successfully to ' ~ samplecertca_url
+              }
+            ]
+          }}
+
+  always:
+    # Purpose: Revoke the certificate from the provider when configured.
+    - name: "Diagnostics - Revoke samplecertca token"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/samplecertca_revoke_token.yaml"
+      when: samplecertca_token | default('', true) | length > 0
+
+# Purpose: Check backend connectivity before running live certificate diagnostics.
+- name: "Diagnostics - samplecertrepo connectivity"
+  ansible.builtin.uri:
+    url: "{{ samplecertrepo_url }}/v1/sys/health"
+    method: GET
+    validate_certs: "{{ samplecertrepo_validate_certs | default(true) }}"
+    status_code: [200, 429, 472, 473, 501, 503]
+  register: _samplecertrepo_health
+  when: diagnostic_mode_effective == 'samplecertrepo_connectivity'
+
+# Purpose: Check backend connectivity before running live certificate diagnostics.
+- name: "Diagnostics - samplecertrepo connectivity result"
+  ansible.builtin.debug:
+    msg: "samplecertrepo health endpoint returned HTTP {{ _samplecertrepo_health.status }} from {{ samplecertrepo_url }}."
+  when: diagnostic_mode_effective == 'samplecertrepo_connectivity'
+
+# Purpose: Store samplecertrepo connectivity diagnostics for the final report.
+- name: "Diagnostics - Record samplecertrepo connectivity result"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'target': 'samplecertrepo',
+            'check': 'health',
+            'status': (
+              'passed'
+              if (_samplecertrepo_health.status | default(0) | int) in [200, 429, 472, 473]
+              else 'attention'
+            ),
+            'detail': 'Health endpoint returned HTTP ' ~ (_samplecertrepo_health.status | default('unknown') | string) ~ ' from ' ~ samplecertrepo_url
+          }
+        ]
+      }}
+  when: diagnostic_mode_effective == 'samplecertrepo_connectivity'
+
+# Purpose: Prepare the certificate diagnostics result shown to the operator.
+- name: "Diagnostics - Registry report"
+  ansible.builtin.include_role:
+    name: cert_monitor
+  when: diagnostic_mode_effective == 'registry_report'
+
+# Purpose: Store registry diagnostics for the final report.
+- name: "Diagnostics - Record registry report result"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'target': (
+              (app_prefix | default(app_sys_id | default('unknown')) | upper)
+              ~ '/'
+              ~ (env_upper | default(mq_environment | default('unknown')) | upper)
+            ),
+            'check': 'registry report',
+            'status': (
+              'attention'
+              if (_monitor_alert_entries | default([]) | length > 0)
+              else 'passed'
+            ),
+            'detail': (
+              (_monitor_alert_entries | default([]) | length | string) ~ ' queue manager(s) need attention'
+              if (_monitor_alert_entries | default([]) | length > 0)
+              else ((_monitor_report | default([]) | length | string) ~ ' queue manager(s) reviewed')
+            )
+          }
+        ]
+      }}
+  when: diagnostic_mode_effective == 'registry_report'
+
+# Purpose: Turn the requested queue manager scope into an exact target list.
+- name: "Diagnostics - Resolve targets"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/resolve_targets.yaml"
+  when: diagnostic_mode_effective in [
+          'samplecertca_cert_status',
+          'samplecertca_get_root_certs',
+          'csr_generate',
+          'openshift_connectivity',
+          'openshift_namespace_check',
+          'openshift_secret_read',
+          'samplecertrepo_cert_read'
+        ]
+
+# Purpose: Run this workflow once for each resolved queue manager target.
+- name: "Diagnostics - Process targets"
+  ansible.builtin.include_tasks: process_target.yaml
+  loop: "{{ cert_targets | default([]) }}"
+  loop_control:
+    loop_var: cert_target
+    label: "{{ cert_target.qmgr_name }}"
+  when: diagnostic_mode_effective in [
+          'samplecertca_cert_status',
+          'samplecertca_get_root_certs',
+          'csr_generate',
+          'openshift_connectivity',
+          'openshift_namespace_check',
+          'openshift_secret_read',
+          'samplecertrepo_cert_read'
+        ]

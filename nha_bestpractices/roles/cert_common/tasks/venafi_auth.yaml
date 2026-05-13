@@ -1,0 +1,29 @@
+---
+# Purpose: Get a samplecertca token before requesting or checking certificates.
+- name: "samplecertca - Authenticate"
+  ansible.builtin.uri:
+    url: "{{ samplecertca_url }}{{ samplecertca_oauth }}"
+    method: POST
+    body_format: json
+    body:
+      username: "{{ samplecertca_username }}"
+      password: "{{ samplecertca_password }}"
+      client_id: "{{ samplecertca_client_id }}"
+      scope: "{{ samplecertca_scope }}"
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    validate_certs: "{{ samplecertca_validate_certs }}"
+    status_code: [200, 201]
+    timeout: "{{ nativeha_api_timeout | default(45) | int }}"
+    use_netrc: false
+    unredirected_headers:
+      - Authorization
+  register: _samplecertca_auth
+  no_log: true
+
+# Purpose: Save the samplecertca token without printing it.
+- name: "samplecertca - Store bearer token"
+  ansible.builtin.set_fact:
+    samplecertca_token: "{{ _samplecertca_auth.json.access_token }}"
+  no_log: true

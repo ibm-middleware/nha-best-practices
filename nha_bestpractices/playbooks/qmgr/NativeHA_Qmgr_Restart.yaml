@@ -1,0 +1,57 @@
+---
+# NativeHA_Qmgr_Restart.yaml - MQ Operator-managed restart
+# Purpose:
+#   Triggers an intentional QueueManager annotation change by updating only
+#   regional restart patch files in the target GitOps repository.
+# AAP survey variables:
+
+# Purpose: Publish restart patch changes for selected queue managers.
+- name: "NativeHA Queue Manager Restart - {{ qmgr_name | default('UNDEFINED') | upper }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  tasks:
+    # Purpose: Publish restart patch changes for selected queue managers.
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    # Purpose: Publish restart patch changes for selected queue managers.
+    - name: "Run queue manager restart workflow"
+      block:
+        # Purpose: Publish restart patch changes for selected queue managers.
+        - name: "Queue manager restart - Execute"
+          ansible.builtin.include_role:
+            name: qmgr_restart
+
+        # Purpose: Publish restart patch changes for selected queue managers.
+        - name: "Queue manager restart - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        # Purpose: Publish restart patch changes for selected queue managers.
+        - name: "Queue manager restart - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        # Purpose: Publish restart patch changes for selected queue managers.
+        - name: "Queue manager restart - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Queue Manager Restart"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Publish an operator-managed QueueManager restart annotation
+              change through GitOps.
+
+        # Purpose: Publish restart patch changes for selected queue managers.
+        - name: "Queue manager restart - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Queue manager restart failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

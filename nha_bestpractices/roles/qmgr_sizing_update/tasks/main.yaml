@@ -1,0 +1,630 @@
+---
+# Queue manager sizing update role
+# Variable map for readers:
+# - AAP survey provides app_sys_id, mq_environment, qmgr_name,
+# - qmgr_name is a selector:
+# - nativeha_qmgr_control_vars.yaml provides env_repo_map,
+# - This role derives the same size tier as Day-1 onboarding by reusing
+# - Before calling target_repo_publish.yaml, this role sets the
+# Important behavior:
+# - Queue manager discovery is Git-only. The playbook never queries OpenShift.
+# - Only overlays/_shared/patches/qm-sizing-patch.yaml is allowed to change.
+# - The base qmgr.yaml is intentionally untouched during sizing updates.
+# - PVC shrink is blocked because Kubernetes supports expansion, not
+# - PVC growth requires allow_volume_expansion=true. The rendered sizing patch
+# - Day-2 sizing must not change queue-manager recovery log file pages. That
+
+# Purpose: Group the work so failures are reported and the temporary Git workspace is removed.
+- name: "Sizing update - Execute with guaranteed workspace cleanup"
+  block:
+    # Purpose: Check operator inputs before starting sizing update changes.
+    - name: "Pre-flight - Validate sizing update inputs"
+      ansible.builtin.assert:
+        that:
+          - app_sys_id | default('', true) | trim | length > 0
+          - mq_environment | default('', true) | trim | length > 0
+          - qmgr_name | default('', true) | trim | length > 0
+          - total_volume_24h | default('', true) | trim | length > 0
+          - avg_msg_size | default('', true) | trim | length > 0
+        fail_msg: >-
+          Required inputs: app_sys_id, mq_environment, qmgr_name,
+          total_volume_24h, avg_msg_size. qmgr_name may be a single queue
+          manager, a comma-separated list, or all.
+
+    # Purpose: Trim and standardize operator input before validation.
+    - name: "Identity - Normalize input values"
+      ansible.builtin.set_fact:
+        app_prefix: "{{ app_sys_id | lower | trim }}"
+        env_upper: "{{ mq_environment | upper | trim }}"
+        qmgr_selector_raw: "{{ qmgr_name | string | lower | trim }}"
+
+    # Purpose: Confirm app and environment are configured.
+    - name: "Pre-flight - Validate app and environment are configured"
+      ansible.builtin.assert:
+        that:
+          - app_prefix is match('^[a-z0-9]{3}$')
+          - env_upper in env_qmgr_abbr
+          - env_upper in env_repo_map
+          - env_upper in env_branch_map
+          - env_upper in env_instance_type_map
+          - env_upper in env_region_map
+          - env_upper in sizing
+        fail_msg: >-
+          app_sys_id must be a 3-character application ID and
+          mq_environment must be configured in nativeha_qmgr_control_vars.yaml.
+          Got app_sys_id={{ app_sys_id | default('undefined') }},
+          mq_environment={{ mq_environment | default('undefined') }}.
+
+    # Purpose: Derive the GitOps repository path for the selected queue manager.
+    - name: "Identity - Derive target repo, root path, and selector values"
+      ansible.builtin.set_fact:
+        env_code: "{{ env_qmgr_abbr[env_upper] | lower }}"
+        git_repo_url: "{{ env_repo_map[env_upper] }}"
+        target_branch: "{{ env_branch_map[env_upper] }}"
+        instance_type: "{{ env_instance_type_map[env_upper] }}"
+        qmgr_root_rel: >-
+          {{
+            ('queue_managers/' ~ qmgr_env_subdir_map[env_upper])
+            if env_upper in (qmgr_env_subdir_map | default({}))
+            else 'queue_managers'
+          }}
+        qmgr_select_all: "{{ qmgr_selector_raw == 'all' }}"
+        qmgr_requested_list: >-
+          {{
+            []
+            if qmgr_selector_raw == 'all'
+            else (qmgr_selector_raw.split(',')
+                  | map('trim')
+                  | reject('equalto', '')
+                  | unique
+                  | list)
+          }}
+
+    # Purpose: Stop early if the requested queue manager scope is empty or malformed.
+    - name: "Pre-flight - Validate queue manager selector"
+      ansible.builtin.assert:
+        that:
+          - qmgr_select_all | bool or qmgr_requested_list | length > 0
+        fail_msg: >-
+          qmgr_name must be all, a single queue manager name, or a
+          comma-separated list of queue manager names.
+
+    # Purpose: Stop early if any supplied queue manager name is malformed.
+    - name: "Pre-flight - Validate explicit queue manager names"
+      ansible.builtin.assert:
+        that:
+          - item is match('^' ~ app_prefix ~ env_code ~ '[0-9]{3}$')
+        fail_msg: >-
+          qmgr_name={{ item }} does not match app_sys_id={{ app_prefix }}
+          and mq_environment={{ env_upper }}. Expected pattern:
+          {{ app_prefix }}{{ env_code }}<3-digit-seq>.
+      loop: "{{ qmgr_requested_list }}"
+      when: not qmgr_select_all | bool
+
+    # Purpose: Calculate requested persistent storage from message volume and size.
+    - name: "Sizing - Compute storage requirement"
+      ansible.builtin.set_fact:
+        _parsed_volume: "{{ total_volume_24h | parse_volume_count | int }}"
+        _parsed_size: "{{ avg_msg_size | human_to_bytes | int }}"
+        _base_storage: >-
+          {{
+            ((total_volume_24h | parse_volume_count | int)
+             * (avg_msg_size | human_to_bytes | int)
+             * 1.20) | int
+          }}
+
+    # Purpose: Confirm positive sizing values.
+    - name: "Sizing - Validate positive sizing values"
+      ansible.builtin.assert:
+        that:
+          - _parsed_volume | int > 0
+          - _parsed_size | int > 0
+        fail_msg: |-
+          Queue manager sizing update inputs are invalid.
+
+          total_volume_24h must be a positive message count such as 1k, 500k, or 1m.
+          avg_msg_size must be a positive byte size such as 4k, 1m, or 10m.
+
+          Received:
+          - total_volume_24h={{ total_volume_24h | default('missing') }} parsed={{ _parsed_volume }}
+          - avg_msg_size={{ avg_msg_size | default('missing') }} parsed={{ _parsed_size }}
+
+          No Git changes were made.
+        quiet: true
+
+    # Purpose: Apply the extra storage multiplier required by CRR queue managers.
+    - name: "Sizing - Apply CRR multiplier"
+      ansible.builtin.set_fact:
+        computed_storage_bytes: >-
+          {{ ((_base_storage | int) * 2) | int if instance_type == 'nhacrr'
+             else (_base_storage | int) }}
+
+    # Purpose: Choose ordered tier list from inputs and defaults.
+    - name: "Sizing - Resolve ordered tier list"
+      ansible.builtin.set_fact:
+        _tier_order: >-
+          {{
+            (sizing_order | default(['small', 'medium', 'large', 'xlarge']))
+            | select('in', sizing[env_upper].keys() | list)
+            | list
+          }}
+
+    # Purpose: Choose the smallest configured MQ size tier that fits the requested load.
+    - name: "Sizing - Select best-matching size tier"
+      ansible.builtin.set_fact:
+        _matched_tier: "{{ sizing[env_upper] | get_best_mq_tier(computed_storage_bytes, _tier_order, env_upper) }}"
+
+    # Purpose: Copy the selected tier CPU, memory, and storage values into named facts.
+    - name: "Sizing - Expand selected tier properties"
+      ansible.builtin.set_fact:
+        selected_size_tier: "{{ _matched_tier.name }}"
+        qmgr_size: >-
+          {{
+            _matched_tier.specs
+            | dict2items
+            | rejectattr('key', 'equalto', 'log_file_pages')
+            | items2dict
+          }}
+
+    # Purpose: Use a run-specific checkout so parallel jobs do not share files.
+    - name: "Git - Isolate working directory for this run"
+      ansible.builtin.set_fact:
+        git_work_dir_base: "{{ git_work_dir }}"
+        git_work_dir: "{{ git_work_dir }}/qmgr_sizing_{{ app_prefix }}_{{ env_upper | lower }}_{{ now(utc=false, fmt='%Y%m%d%H%M%S') }}_{{ 1000000 | random }}"
+
+    # Purpose: Create the parent directory for temporary Git checkouts.
+    - name: "Git - Ensure work base exists"
+      ansible.builtin.file:
+        path: "{{ git_work_dir_base }}"
+        state: directory
+        mode: "0755"
+      check_mode: false
+
+    # Purpose: Clone the target repository and set the automation Git identity.
+    - name: "Git - Clone and configure target repo"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: git_clone_and_configure
+
+    # Purpose: Serialize direct-mode GitOps changes before reading and rendering patch files.
+    - name: "Git - Acquire direct publish lock"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: direct_publish_lock_acquire
+      vars:
+        direct_publish_lock_sync_after_acquire: true
+
+    # Purpose: Confirm queue manager root exists.
+    - name: "Discovery - Check queue manager root exists"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ qmgr_root_rel }}"
+      register: _qmgr_root_stat
+
+    # Purpose: Stop when queue manager root is missing.
+    - name: "Discovery - Fail if queue manager root is missing"
+      ansible.builtin.assert:
+        that:
+          - _qmgr_root_stat.stat.exists
+          - _qmgr_root_stat.stat.isdir
+        fail_msg: >-
+          Queue manager root {{ qmgr_root_rel }} does not exist in
+          {{ git_repo_url }} branch {{ target_branch }} for {{ env_upper }}.
+
+    # Purpose: Read existing queue manager files so only real targets are changed.
+    - name: "Discovery - Find all queue managers for selected app and environment"
+      ansible.builtin.find:
+        paths: "{{ git_work_dir }}/{{ qmgr_root_rel }}"
+        file_type: directory
+        recurse: false
+        use_regex: true
+        patterns: "^{{ app_prefix }}{{ env_code }}[0-9]{3}$"
+      register: _sizing_all_qmgr_dirs
+      when: qmgr_select_all | bool
+
+    # Purpose: Store the exact queue managers selected by the operator.
+    - name: "Discovery - Set targets from all selector"
+      ansible.builtin.set_fact:
+        qmgr_target_names: >-
+          {{
+            _sizing_all_qmgr_dirs.files
+            | map(attribute='path')
+            | map('basename')
+            | sort
+            | list
+          }}
+      when: qmgr_select_all | bool
+
+    # Purpose: Store the exact queue managers selected by the operator.
+    - name: "Discovery - Set targets from explicit selector"
+      ansible.builtin.set_fact:
+        qmgr_target_names: "{{ qmgr_requested_list }}"
+      when: not qmgr_select_all | bool
+
+    # Purpose: Stop when no queue managers were selected.
+    - name: "Discovery - Fail if no queue managers were selected"
+      ansible.builtin.assert:
+        that:
+          - qmgr_target_names | length > 0
+        fail_msg: >-
+          No queue managers matched app_sys_id={{ app_prefix }},
+          mq_environment={{ env_upper }}, qmgr_name={{ qmgr_name }}.
+
+    # Purpose: Confirm selected queue manager directories.
+    - name: "Discovery - Check selected queue manager directories"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ qmgr_root_rel }}/{{ item }}"
+      loop: "{{ qmgr_target_names }}"
+      register: _qmgr_dir_stats
+
+    # Purpose: List selected queue managers that do not exist in the GitOps repo.
+    - name: "Discovery - Collect missing queue manager directories"
+      ansible.builtin.set_fact:
+        _missing_qmgr_dirs: "{{ _qmgr_dir_stats.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+
+    # Purpose: Stop when selected queue managers do not exist.
+    - name: "Discovery - Fail if selected queue managers do not exist"
+      ansible.builtin.fail:
+        msg: >-
+          Selected queue managers do not exist under {{ qmgr_root_rel }}:
+          {{ _missing_qmgr_dirs }}.
+      when: _missing_qmgr_dirs | length > 0
+
+    # Purpose: Build the exact patch file paths this run is allowed to edit.
+    - name: "Discovery - Compute expected sizing patch paths"
+      ansible.builtin.set_fact:
+        _expected_sizing_patch_paths: >-
+          {% set paths = [] -%}
+          {% for qname in qmgr_target_names -%}
+          {{ paths.append(qmgr_root_rel ~ '/' ~ qname ~ '/overlays/_shared/patches/qm-sizing-patch.yaml') or '' }}
+          {%- endfor -%}
+          {{ paths | sort }}
+        _qmgr_target_names_upper: "{{ qmgr_target_names | map('upper') | list }}"
+
+    # Purpose: Confirm shared sizing patch files.
+    - name: "Discovery - Check shared sizing patch files"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ item }}"
+      loop: "{{ _expected_sizing_patch_paths }}"
+      register: _sizing_patch_stats
+
+    # Purpose: List sizing patch files that are missing from selected overlays.
+    - name: "Discovery - Collect missing sizing patches"
+      ansible.builtin.set_fact:
+        _missing_sizing_patches: "{{ _sizing_patch_stats.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+
+    # Purpose: Stop when shared sizing patches are missing.
+    - name: "Discovery - Fail if shared sizing patches are missing"
+      ansible.builtin.fail:
+        msg: >-
+          Missing qm-sizing-patch.yaml files for selected queue managers:
+          {{ _missing_sizing_patches }}. Sizing update requires
+          overlays/_shared/patches/qm-sizing-patch.yaml.
+      when: _missing_sizing_patches | length > 0
+
+    # Purpose: Read current sizing patch values before checking shrink or growth rules.
+    - name: "Sizing - Read current sizing patches"
+      ansible.builtin.slurp:
+        src: "{{ git_work_dir }}/{{ item }}"
+      loop: "{{ _expected_sizing_patch_paths }}"
+      register: _current_sizing_patch_slurps
+      changed_when: false
+
+    # Purpose: Start clean tracking data for this part of the workflow.
+    - name: "Sizing - Initialize current patch value list"
+      ansible.builtin.set_fact:
+        _sizing_current_patch_values: []
+
+    # Purpose: Read current CPU, memory, and storage values from the sizing patch.
+    - name: "Sizing - Parse current sizing patch values"
+      ansible.builtin.set_fact:
+        _sizing_current_patch_values: >-
+          {{
+            _sizing_current_patch_values
+            + [{
+              'path': item.item,
+              'patch': (item.content | b64decode | from_yaml)
+            }]
+          }}
+      loop: "{{ _current_sizing_patch_slurps.results }}"
+
+    # Purpose: Block storage reductions because the MQ data volume cannot be safely shrunk.
+    - name: "Sizing - Prevent unsupported storage shrink"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (qmgr_size.qmgr_storage | parse_storage_bytes | int)
+            >= (_current_qmgr_storage | parse_storage_bytes | int)
+          - >-
+            (qmgr_size.log_storage | parse_storage_bytes | int)
+            >= (_current_log_storage | parse_storage_bytes | int)
+        fail_msg: >-
+          Sizing update for {{ item.path }} would shrink storage from
+          queue manager {{ _current_qmgr_storage }} to {{ qmgr_size.qmgr_storage }}
+          or logs {{ _current_log_storage }} to {{ qmgr_size.log_storage }}.
+          Kubernetes PVC shrink is not supported. Use a migration/rebuild
+          procedure for storage reduction.
+      vars:
+        _current_qmgr_storage: >-
+          {{
+            (item.patch
+             | selectattr('path', 'equalto', '/spec/queueManager/storage/queueManager/size')
+             | map(attribute='value')
+             | first
+             | default('0', true))
+          }}
+        _current_log_storage: >-
+          {{
+            (item.patch
+             | selectattr('path', 'equalto', '/spec/queueManager/storage/recoveryLogs/size')
+             | map(attribute='value')
+             | first
+             | default('0', true))
+          }}
+      loop: "{{ _sizing_current_patch_values }}"
+
+    # Purpose: Require explicit volume expansion approval before increasing storage.
+    - name: "Sizing - Require volume expansion for storage growth"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (not (_qmgr_storage_grows | bool or _log_storage_grows | bool))
+            or (allow_volume_expansion | default(true) | bool)
+        fail_msg: >-
+          Sizing update for {{ item.path }} increases storage from queue manager
+          {{ _current_qmgr_storage }} to {{ qmgr_size.qmgr_storage }} or logs
+          {{ _current_log_storage }} to {{ qmgr_size.log_storage }}, but
+          allow_volume_expansion is false. IBM MQ Operator storage expansion
+          requires spec.queueManager.storage.allowVolumeExpansion=true, and the
+          target StorageClass must also support expansion.
+      vars:
+        _current_qmgr_storage: >-
+          {{
+            (item.patch
+             | selectattr('path', 'equalto', '/spec/queueManager/storage/queueManager/size')
+             | map(attribute='value')
+             | first
+             | default('0', true))
+          }}
+        _current_log_storage: >-
+          {{
+            (item.patch
+             | selectattr('path', 'equalto', '/spec/queueManager/storage/recoveryLogs/size')
+             | map(attribute='value')
+             | first
+             | default('0', true))
+          }}
+        _qmgr_storage_grows: >-
+          {{
+            (qmgr_size.qmgr_storage | parse_storage_bytes | int)
+            > (_current_qmgr_storage | parse_storage_bytes | int)
+          }}
+        _log_storage_grows: >-
+          {{
+            (qmgr_size.log_storage | parse_storage_bytes | int)
+            > (_current_log_storage | parse_storage_bytes | int)
+          }}
+      loop: "{{ _sizing_current_patch_values }}"
+
+    # Purpose: Prepare the sizing update result shown to the operator.
+    - name: "Sizing - Display summary"
+      ansible.builtin.debug:
+        msg:
+          - "Queue manager sizing update plan"
+          - "Application ID : {{ app_prefix | upper }}"
+          - "Environment    : {{ env_upper }}"
+          - "Selector       : {{ qmgr_selector_raw }}"
+          - "Queue Managers : {{ _qmgr_target_names_upper | join(', ') }}"
+          - "Size Tier      : {{ selected_size_tier }}"
+          - "Runtime Request: {{ qmgr_size.request_cpu }}/{{ qmgr_size.request_memory }}"
+          - "Runtime Limits : {{ qmgr_size.limits_cpu }}/{{ qmgr_size.limits_memory }}"
+          - "QM Storage     : {{ qmgr_size.qmgr_storage }}"
+          - "Log Storage    : {{ qmgr_size.log_storage }}"
+          - "Computed Bytes : {{ computed_storage_bytes }}"
+          - "Patch Files    : {{ _expected_sizing_patch_paths | length }}"
+          - "Target Repo    : {{ git_repo_url }}"
+          - "Target Branch  : {{ target_branch }}"
+
+    # Purpose: Write requested CPU, memory, and storage values into the sizing patch.
+    - name: "Sizing - Render qm-sizing-patch.yaml for selected patch files"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../../nativeha_templates/overlays/qm_sizing_patch.yaml.j2"
+        dest: "{{ git_work_dir }}/{{ item }}"
+        mode: "0644"
+      loop: "{{ _expected_sizing_patch_paths }}"
+
+    # Purpose: Build overlay paths that must render cleanly before publish.
+    - name: "Validation - Compute regional overlay render paths"
+      ansible.builtin.set_fact:
+        _sizing_target_overlay_paths: >-
+          {% set paths = [] -%}
+          {% for qname in qmgr_target_names -%}
+          {% for rname in env_region_map[env_upper] -%}
+          {{ paths.append(qmgr_root_rel ~ '/' ~ qname ~ '/overlays/' ~ rname) or '' }}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ paths | sort }}
+
+    # Purpose: Render and validate selected regional overlays using shared task.
+    - name: "Validation - Render selected regional overlays"
+      ansible.builtin.include_tasks: "{{ role_path }}/../gitops_publish/tasks/validate_kustomize_render.yaml"
+      vars:
+        _kustomize_overlay_paths: >-
+          {{
+            _sizing_target_overlay_paths
+            | map('regex_replace', '^(.*)$', git_work_dir ~ '/\1')
+            | list
+          }}
+
+    # Purpose: Check that rendered overlays contain the requested sizing values.
+    - name: "Validation - Check rendered sizing values"
+      ansible.builtin.assert:
+        that:
+          - "qmgr_size.request_cpu in item.stdout"
+          - "qmgr_size.request_memory in item.stdout"
+          - "qmgr_size.limits_cpu in item.stdout"
+          - "qmgr_size.limits_memory in item.stdout"
+          - "qmgr_size.qmgr_storage in item.stdout"
+          - "qmgr_size.log_storage in item.stdout"
+          - _expected_allow_volume_expansion_text in item.stdout
+        fail_msg: >-
+          Render validation failed for overlay {{ item.item }}. Expected
+          selected size tier values in rendered QueueManager output.
+      vars:
+        _expected_allow_volume_expansion_text: >-
+          allowVolumeExpansion: {{ (allow_volume_expansion | default(true) | bool) | ternary('true', 'false') }}
+      loop: "{{ _render_results.results }}"
+
+    # Purpose: Read Git status paths so only expected files are allowed.
+    - name: "Git - Check pending sizing changes"  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: git status --porcelain
+      args:
+        chdir: "{{ git_work_dir }}"
+      register: _sizing_git_status
+      changed_when: false
+      check_mode: false
+
+    # Purpose: Convert Git status output into paths checked against the allow-list.
+    - name: "Git - Classify pending sizing change paths"
+      ansible.builtin.set_fact:
+        _sizing_changed_paths: "{{ _sizing_git_status.stdout_lines | map('regex_replace', '^.. +', '') | list }}"
+        _sizing_unexpected_paths: >-
+          {{
+            (_sizing_git_status.stdout_lines
+             | map('regex_replace', '^.. +', '')
+             | list)
+            | difference(_expected_sizing_patch_paths)
+          }}
+
+    # Purpose: Stop when sizing update changed unexpected files.
+    - name: "Git - Fail if sizing update changed unexpected files"
+      ansible.builtin.assert:
+        that:
+          - _sizing_unexpected_paths | length == 0
+        fail_msg: >-
+          Sizing update changed unexpected files: {{ _sizing_unexpected_paths }}.
+          Expected only discovered sizing patches:
+          {{ _expected_sizing_patch_paths }}.
+
+    # Purpose: Choose publish identity from inputs and defaults.
+    - name: "Git - Resolve publish identity"
+      ansible.builtin.set_fact:
+        _sizing_publish_subject: >-
+          {{
+            qmgr_target_names[0]
+            if qmgr_target_names | length == 1
+            else app_prefix ~ '-' ~ (env_upper | lower) ~ '-sizing-update'
+          }}
+        _sizing_publish_title_subject: >-
+          {{
+            (qmgr_target_names[0] | upper)
+            if qmgr_target_names | length == 1
+            else (app_prefix | upper) ~ ' ' ~ env_upper ~ ' sizing update'
+          }}
+        _sizing_publish_repo_path: >-
+          {{
+            qmgr_root_rel ~ '/' ~ qmgr_target_names[0]
+            if qmgr_target_names | length == 1
+            else qmgr_root_rel
+          }}
+        _sizing_publish_changelog_path: >-
+          {{
+            qmgr_root_rel ~ '/' ~ qmgr_target_names[0] ~ '/CHANGELOG.md'
+            if qmgr_target_names | length == 1
+            else qmgr_root_rel ~ '/CHANGELOG.md'
+          }}
+
+    # Purpose: Prepare the title, summary, and validation text for the GitOps change.
+    - name: "Git - Prepare target repo publish metadata"
+      ansible.builtin.set_fact:
+        target_repo_pr_action_slug: "qmgr-sizing-update"
+        target_repo_pr_action_label: "Update QM Sizing"
+        target_repo_pr_branch_subject: "{{ _sizing_publish_subject }}"
+        target_repo_pr_title_subject: "{{ _sizing_publish_title_subject }}"
+        target_repo_pr_qmgr_label: "{{ _qmgr_target_names_upper | join(', ') }}"
+        target_repo_pr_repo_path: "{{ _sizing_publish_repo_path }}"
+        target_repo_pr_changelog_path: "{{ _sizing_publish_changelog_path }}"
+        target_repo_pr_summary: >-
+          Update queue manager sizing for {{ _qmgr_target_names_upper | join(', ') }}
+          in {{ env_upper }} to tier {{ selected_size_tier }}:
+          requests {{ qmgr_size.request_cpu }}/{{ qmgr_size.request_memory }},
+          limits {{ qmgr_size.limits_cpu }}/{{ qmgr_size.limits_memory }},
+          storage {{ qmgr_size.qmgr_storage }}/{{ qmgr_size.log_storage }}.
+        target_repo_pr_validation: >-
+          Rendered selected regional overlays and verified sizing values.
+          Confirmed only qm-sizing-patch.yaml files changed before adding
+          CHANGELOG.md.
+
+    # Purpose: Publish the prepared GitOps changes by pull request or direct commit.
+    - name: "Git - Publish target repo changes"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: target_repo_publish
+
+    # Purpose: Record the workflow result for final reporting.
+    - name: "Sizing - Complete"
+      ansible.builtin.debug:
+        msg:
+          - "Sizing update complete"
+          - "Environment   : {{ env_upper }}"
+          - "Queue Managers: {{ _qmgr_target_names_upper | join(', ') }}"
+          - "Size Tier     : {{ selected_size_tier }}"
+          - "Runtime Req   : {{ qmgr_size.request_cpu }}/{{ qmgr_size.request_memory }}"
+          - "Runtime Limit : {{ qmgr_size.limits_cpu }}/{{ qmgr_size.limits_memory }}"
+          - "Storage       : {{ qmgr_size.qmgr_storage }}/{{ qmgr_size.log_storage }}"
+          - "Base Branch   : {{ target_branch }}"
+          - "Change Mode   : {{ target_repo_pr_result.mode | default(target_repo_change_mode | default('pull_request')) }}"
+          - "Publish Branch: {{ target_repo_pr_result.branch | default('not created') }}"
+          - "PR URL        : {{ target_repo_pr_result.pull_request_url | default('not created') }}"
+
+  rescue:
+    # Purpose: Save the real failure detail before the final report is built.
+    - name: "Rescue - Capture sizing update failure detail"
+      ansible.builtin.set_fact:
+        _qmgr_sizing_failure_detail: >-
+          {{
+            ansible_failed_result.msg
+            | default(
+                ansible_failed_result.stderr
+                | default('Queue manager sizing update failed before a detailed cause was returned.')
+              )
+            | string
+            | regex_replace('\n{3,}', '\n\n')
+            | trim
+          }}
+
+    # Purpose: Print the captured failure detail in the job log.
+    - name: "Rescue - Log sizing update failure"
+      ansible.builtin.debug:
+        msg:
+          - "Queue manager sizing update failed"
+          - "Queue Manager : {{ qmgr_name | default('not supplied') | upper }}"
+          - "Environment   : {{ mq_environment | default('not supplied') | upper }}"
+          - "Root Cause    : {{ _qmgr_sizing_failure_detail }}"
+
+    # Purpose: End the AAP job as failed after reporting the original problem.
+    - name: "Rescue - Re-raise sizing update failure"
+      ansible.builtin.fail:
+        msg: |-
+          Queue manager sizing update failed.
+
+          {{ _qmgr_sizing_failure_detail }}
+
+  always:
+    # Purpose: Release the direct publish lock before removing the temporary checkout.
+    - name: "Always - Release direct publish lock"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: direct_publish_lock_release
+      when: _direct_publish_lock_acquired | default(false) | bool
+
+    # Purpose: Remove temporary files created during this run.
+    - name: "Always - Remove git working directory"
+      ansible.builtin.file:
+        path: "{{ git_work_dir }}"
+        state: absent
+      when:
+        - git_work_dir is defined
+        - git_work_dir_base is defined
+        - git_work_dir != git_work_dir_base
+      check_mode: false

@@ -1,3 +1,11 @@
+{#
+  Deployment for the MQ Prometheus exporter side workload.
+  Runs the exporter container that scrapes MQ metrics using the generated
+  prometheus_config ConfigMap.
+  qmgr onboarding facts: qmgr_name, namespace.
+  prometheus_resources.
+  base/monitoring/prometheus_deployment.yaml.
+#}
 ---
 # Prometheus MQ exporter Deployment
 apiVersion: apps/v1

@@ -1,0 +1,263 @@
+---
+# Purpose: Load the selected queue manager facts for this target.
+- name: "Offboard target - Set context"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/set_current_target.yaml"
+
+# Purpose: Confirm OpenShift delete access before certificate offboard removes Secrets.
+- name: "Offboard target - Validate OpenShift delete access"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_store_ocp/tasks/validate_namespaces.yaml"
+  vars:
+    ocp_secret_required_verbs:
+      - get
+      - delete
+    ocp_secret_preflight_action: delete
+  when: cert_delivery_backend_effective == 'openshift_secret'
+
+# Purpose: Confirm samplecertrepo delete access before certificate offboard removes secrets.
+- name: "Offboard target - Validate samplecertrepo delete access"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/samplecertrepo_preflight.yaml"
+  vars:
+    samplecertrepo_preflight_required_capabilities:
+      - delete
+      - read
+  when: cert_delivery_backend_effective == 'samplecertrepo'
+
+# Purpose: Clear per-target registry update fields before offboard work starts.
+- name: "Offboard target - Reset registry state"
+  ansible.builtin.set_fact:
+    _revoked_certs: {}
+    _offboard_existing_certs: {}
+
+# Purpose: Group offboard work so the samplecertca token is cleared after use.
+- name: "Offboard target - Execute with token cleanup"
+  block:
+    # Purpose: Read certificate inventory before deciding what must change.
+    - name: "Offboard target - Read registry snapshot"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/read_registry.yaml"
+      when: cert_registry_enabled | default(false) | bool
+
+    # Purpose: Keep existing certificate serial and subject details before revoke or delete.
+    - name: "Offboard target - Capture existing certificate metadata"
+      ansible.builtin.set_fact:
+        _offboard_existing_certs: >-
+          {{
+            cert_registry[qmgr_name].certs
+            if (
+              cert_registry is defined
+              and qmgr_name in cert_registry
+              and cert_registry[qmgr_name].certs is defined
+            )
+            else {}
+          }}
+      no_log: true
+
+    # Purpose: Stop early if samplecertca connection settings are incomplete.
+    - name: "Offboard target - Validate certificate provider settings"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/validate_samplecertca_config.yaml"
+
+    # Purpose: Get a samplecertca token before requesting or checking certificates.
+    - name: "Offboard target - Authenticate to certificate provider"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/samplecertca_auth.yaml"
+
+    # Purpose: Delete the OpenShift Secret for the selected certificate backend.
+    - name: "Offboard target - Delete OpenShift secrets"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_store_ocp/tasks/delete_secret.yaml"
+      when: cert_delivery_backend_effective == 'openshift_secret'
+
+    # Purpose: Delete the OpenShift Secret for the selected certificate backend.
+    - name: "Offboard target - Delete samplecertrepo secrets"
+      ansible.builtin.include_tasks: samplecertrepo_delete.yaml
+      when: cert_delivery_backend_effective == 'samplecertrepo'
+
+    # Purpose: Revoke the certificate from the provider when configured.
+    - name: "Offboard target - Revoke certificate records"
+      ansible.builtin.uri:
+        url: "{{ samplecertca_url }}{{ samplecertca_revoke }}"
+        method: POST
+        headers:
+          accept: "application/json"
+          Authorization: "Bearer {{ samplecertca_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          CertificateDN: "{{ samplecertca_policy_dn }}\\{{ qmgr_name }}_{{ cert_type_csr_suffix[item] }}"
+          Reason: "{{ samplecertca_revoke_reason }}"
+          Comments: "{{ samplecertca_revoke_comments }}"
+          Disable: "{{ samplecertca_revoke_disable }}"
+        validate_certs: "{{ samplecertca_validate_certs }}"
+        status_code: [200, 201, 202, 204]
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _samplecertca_revoke_results
+      failed_when: false
+      no_log: true
+
+    # Purpose: Start clean tracking data for this part of the workflow.
+    - name: "Offboard target - Initialize revoke failures"
+      ansible.builtin.set_fact:
+        _samplecertca_revoke_failures: []
+
+    # Purpose: Convert failed module results into safe, readable failure messages.
+    - name: "Offboard target - Collect revoke failures"
+      ansible.builtin.set_fact:
+        _samplecertca_revoke_failures: >-
+          {{
+            _samplecertca_revoke_failures + [
+              {
+                'cert_type': item.item | default('unknown'),
+                'samplecertca_dn': samplecertca_policy_dn ~ '\\' ~ qmgr_name ~ '_' ~ cert_type_csr_suffix[item.item | default('app')],
+                'status': item.status | default('unknown'),
+                'detail': (
+                  item.json.Error
+                  | default(
+                      item.json.Message
+                      | default(
+                          item.msg
+                          | default(item.content | default('Certificate provider revoke failed without a response message.', true), true),
+                          true
+                        ),
+                      true
+                    )
+                  | string
+                  | regex_replace('\n+', ' ')
+                  | regex_replace('\s+', ' ')
+                  | regex_replace('(?i)(bearer|token|password)[:= ]+[^\\s,;}]+', '\1 [redacted]')
+                  | trim
+                )
+              }
+            ]
+          }}
+      loop: "{{ _samplecertca_revoke_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('unknown') }}"
+      when: >-
+        item.failed | default(false) | bool
+        or (item.status | default(0) | int) not in [200, 201, 202, 204]
+        or item.exception is defined
+        or (
+          item.msg is defined
+          and item.msg | string | trim is search('(?i)(failed|forbidden|unauthorized|invalid|denied|cannot|unable|error)')
+        )
+      no_log: true
+
+    # Purpose: Stop when certificate revoke failed.
+    - name: "Offboard target - Fail if certificate revoke failed"
+      ansible.builtin.fail:
+        msg: |-
+          Certificate revocation failed for {{ qmgr_name | upper }}.
+
+          Failed certificate object(s):
+          {% for failure in _samplecertca_revoke_failures %}
+          - {{ failure.cert_type }}: {{ failure.samplecertca_dn }}
+            Status: {{ failure.status }}
+            Detail: {{ failure.detail }}
+          {% endfor %}
+
+          Backend certificate material may already have been removed.
+          {% if cert_registry_enabled | default(false) | bool %}
+          The optional certificate registry was not updated.
+          {% endif %}
+          Please fix certificate provider access or certificate state, then rerun offboard so backend and provider status are completed.
+      when: _samplecertca_revoke_failures | length > 0
+
+    # Purpose: Prepare revoked registry cert data.
+    - name: "Offboard target - Build revoked registry cert data"
+      ansible.builtin.set_fact:
+        _revoked_certs: >-
+          {{ _revoked_certs | default({}) | combine({
+               item: {
+                 'status': 'revoked',
+                 'common_name': cert_common_name,
+                 'subject': {},
+                 'issuer': '',
+                 'serial_number': _offboard_existing_certs.get(item, {}).get('serial_number', ''),
+                 'thumbprint': _offboard_existing_certs.get(item, {}).get('thumbprint', ''),
+                 'not_before': _offboard_existing_certs.get(item, {}).get('not_before', ''),
+                 'not_after': _offboard_existing_certs.get(item, {}).get('not_after', ''),
+                 'days_remaining': 0,
+                 'samplecertca_dn': samplecertca_policy_dn ~ '\\' ~ qmgr_name ~ '_' ~ cert_type_csr_suffix[item],
+                 'samplecertca_guid': _offboard_existing_certs.get(item, {}).get('samplecertca_guid', ''),
+                 'samplecertrepo_path': samplecertrepo_cert_base_path ~ '/' ~ cert_type_samplecertrepo_subpath[item],
+                 'openshift_secret': qmgr_name ~ '-' ~ cert_type_samplecertrepo_subpath[item],
+                 'delivery_backend': cert_delivery_backend_effective,
+                 'last_action': 'offboard',
+                 'last_action_date': now(utc=true) | string
+               }
+             })
+          }}
+      loop: "{{ active_cert_types }}"
+
+    # Purpose: Write certificate inventory metadata on the registry branch.
+    - name: "Offboard target - Update registry"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/update_registry.yaml"
+      vars:
+        registry_update:
+          qmgr_name: "{{ qmgr_name }}"
+          data:
+            app_sys_id: "{{ app_sys_id }}"
+            app_prefix: "{{ app_prefix }}"
+            environment: "{{ env_upper }}"
+            qmgr_name: "{{ qmgr_name }}"
+            namespace: "{{ namespace }}"
+            sequence_number: "{{ sequence_number }}"
+            instance_type: "{{ instance_type }}"
+            cert_profile: "{{ active_cert_types }}"
+            delivery_backend: "{{ cert_delivery_backend_effective }}"
+            target_regions: "{{ target_regions }}"
+            samplecertrepo_base_path: "{{ samplecertrepo_cert_base_path }}"
+            samplecertrepo_mount: "{{ samplecertrepo_cert_mount_point }}"
+            samplecertrepo_namespace: "{{ samplecertrepo_namespace }}"
+            last_updated: "{{ now(utc=true) | string }}"
+            certs: "{{ _revoked_certs }}"
+        registry_commit_msg: >-
+          cert offboard: {{ qmgr_name | upper }} backend={{ cert_delivery_backend_effective }}
+      when: cert_registry_enabled | default(false) | bool
+
+    # Purpose: Prepare the certificate offboard result shown to the operator.
+    - name: "Offboard target - Capture final report data"
+      ansible.builtin.set_fact:
+        nativeha_report_cert_results: >-
+          {{
+            nativeha_report_cert_results | default([])
+            + [
+              {
+                'qmgr_name': qmgr_name,
+                'environment': env_upper,
+                'namespace': namespace,
+                'backend': cert_delivery_backend_effective,
+                'cert_types': active_cert_types,
+                'actioned': active_cert_types,
+                'certs': _revoked_certs,
+                'actions': {},
+                'registry_enabled': cert_registry_enabled | default(false) | bool,
+                'registry_updated': (
+                  cert_registry_enabled | default(false) | bool
+                  and _registry_git_diff is defined
+                  and (_registry_git_diff.rc | default(0) | int) != 0
+                )
+              }
+            ]
+          }}
+
+    # Purpose: Record the workflow result for final reporting.
+    - name: "Offboard target - Complete"
+      ansible.builtin.debug:
+        msg:
+          - "Offboard complete for {{ qmgr_name | upper }}."
+          - >-
+            Registry      :
+            {% if cert_registry_enabled | default(false) | bool and _registry_git_diff is defined
+                  and (_registry_git_diff.rc | default(0) | int) != 0 %}
+            Updated
+            {% elif not (cert_registry_enabled | default(false) | bool) %}
+            Disabled
+            {% else %}
+            Already current
+            {% endif %}
+
+  always:
+    # Purpose: Revoke the certificate from the provider when configured.
+    - name: "Offboard target - Revoke certificate provider token"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/samplecertca_revoke_token.yaml"
+      when: samplecertca_token | default('', true) | length > 0

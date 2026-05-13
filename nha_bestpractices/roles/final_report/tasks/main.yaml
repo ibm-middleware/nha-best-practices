@@ -1,0 +1,212 @@
+---
+# Shared final HTML report sender for MQ NativeHA playbooks.
+
+# Purpose: Clean the email recipient list before SMTP send.
+- name: "Final report - Normalize recipients"
+  ansible.builtin.set_fact:
+    _nativeha_report_recipients: >-
+      {{
+        notification_email_to
+        if notification_email_to is sequence and notification_email_to is not string
+        else (
+          (notification_email_to | default('') | string).split(',')
+          | map('trim')
+          | reject('equalto', '')
+          | list
+        )
+      }}
+
+# Purpose: Resolve title once before other report facts depend on it.
+- name: "Final report - Resolve effective title"
+  ansible.builtin.set_fact:
+    _nativeha_report_title_effective: >-
+      {{
+        final_report_title
+        | default(
+            nativeha_report_title
+            | default(ansible_play_name | default('MQ NativeHA Automation'))
+          )
+        | trim
+      }}
+
+# Purpose: Collect job id, requester, target scope, and display flags for the report.
+- name: "Final report - Build metadata"
+  ansible.builtin.set_fact:
+    _nativeha_report_status: >-
+      {{
+        final_report_status
+        | default(nativeha_report_status | default('success'))
+        | lower
+      }}
+    _nativeha_report_title: >-
+      {{
+        _nativeha_report_title_effective
+        | default('MQ NativeHA Automation', true)
+      }}
+    _nativeha_report_env: "{{ env_upper | default(mq_environment | default('not specified')) | upper }}"
+    _nativeha_report_app: "{{ app_prefix | default(app_sys_id | default('not specified')) | upper }}"
+    _nativeha_report_targets: >-
+      {% if _qmgr_target_names_upper is defined and (_qmgr_target_names_upper | length > 0) %}
+      {{ _qmgr_target_names_upper | join(', ') }}
+      {% elif qmgr_target_names is defined and (qmgr_target_names | length > 0) %}
+      {{ qmgr_target_names | map('upper') | join(', ') }}
+      {% elif qmgr_selector_display is defined and (qmgr_selector_display | string | trim | length > 0) %}
+      {{ qmgr_selector_display }}
+      {% elif qmgr_selector_raw is defined and (qmgr_selector_raw | string | trim | length > 0) %}
+      {{ qmgr_selector_raw }}
+      {% elif _monitor_qmgr_names is defined and (_monitor_qmgr_names | length > 0) %}
+      {{ _monitor_qmgr_names | map('upper') | join(', ') }}
+      {% elif qmgr_requested_list is defined and (qmgr_requested_list | length > 0) %}
+      {{ qmgr_requested_list | map('upper') | join(', ') }}
+      {% elif cert_targets is defined and (cert_targets | length > 0) %}
+      {{ cert_targets | map(attribute='qmgr_name') | map('upper') | join(', ') }}
+      {% elif qmgr_name_normalized is defined and (qmgr_name_normalized | string | length > 0) %}
+      {{ qmgr_name_normalized | upper }}
+      {% elif qmgr_name_upper is defined and (qmgr_name_upper | string | length > 0) %}
+      {{ qmgr_name_upper }}
+      {% elif qmgr_name is defined and (qmgr_name | string | length > 0) %}
+      {{ qmgr_name | upper }}
+      {% else %}
+      not specified
+      {% endif %}
+    _nativeha_report_timestamp: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+    _nativeha_report_started_at: >-
+      {{
+        nativeha_job_started_at
+        | default(tower_job_started | default('', true), true)
+        | default(awx_job_started | default('', true), true)
+        | default(lookup('ansible.builtin.env', 'AWX_JOB_STARTED', default=''), true)
+        | default(lookup('ansible.builtin.env', 'TOWER_JOB_STARTED', default=''), true)
+        | default(lookup('ansible.builtin.env', 'JOB_STARTED', default=''), true)
+        | default(now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'), true)
+      }}
+    _nativeha_report_job_id: >-
+      {{
+        tower_job_id
+        | default(awx_job_id | default('', true), true)
+        | default(lookup('ansible.builtin.env', 'AWX_JOB_ID', default=''), true)
+        | default(lookup('ansible.builtin.env', 'TOWER_JOB_ID', default=''), true)
+        | default(lookup('ansible.builtin.env', 'CONTROLLER_JOB_ID', default=''), true)
+        | default(lookup('ansible.builtin.env', 'JOB_ID', default=''), true)
+        | default('local-run', true)
+      }}
+    _nativeha_report_requested_by: "NativeHA-Automation"
+    _nativeha_report_show_app: "{{ _nativeha_report_title_effective != 'Queue Manager Restart' }}"
+    _nativeha_report_show_gitops_details: >-
+      {{
+        target_repo_pr_result is defined
+        and git_repo_url is defined
+        and (git_repo_url | default('', true) | trim | length > 0)
+      }}
+
+# Purpose: Remove extra whitespace from report fields before rendering.
+- name: "Final report - Trim display metadata"
+  ansible.builtin.set_fact:
+    _nativeha_report_status: "{{ _nativeha_report_status | trim }}"
+    _nativeha_report_title: "{{ _nativeha_report_title | trim }}"
+    _nativeha_report_env: "{{ _nativeha_report_env | trim }}"
+    _nativeha_report_app: "{{ _nativeha_report_app | trim }}"
+    _nativeha_report_targets: "{{ _nativeha_report_targets | trim }}"
+    _nativeha_report_started_at: "{{ _nativeha_report_started_at | string | trim }}"
+    _nativeha_report_job_id: "{{ _nativeha_report_job_id | string | trim }}"
+    _nativeha_report_requested_by: "{{ _nativeha_report_requested_by | trim }}"
+
+# Purpose: Choose the short summary shown in both console and email output.
+- name: "Final report - Normalize business summary"
+  ansible.builtin.set_fact:
+    _nativeha_report_summary: >-
+      {{
+        target_repo_pr_summary
+        | default(
+            final_report_summary
+            | default(nativeha_report_summary | default('Automation run completed.')),
+            true
+          )
+        | trim
+      }}
+
+# Purpose: Choose the failure text shown when the playbook ends failed.
+- name: "Final report - Normalize failure detail"
+  ansible.builtin.set_fact:
+    _nativeha_report_error: >-
+      {{
+        final_report_error
+        | default(
+            nativeha_report_error
+            | default(
+                'The playbook failed. Review the AAP job output for task-level details.'
+              ),
+            true
+          )
+        | trim
+      }}
+
+# Purpose: Print the same high-level result that the email report contains.
+- name: "Final report - Display run summary"
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.template', 'console.txt.j2').split('\n') }}"
+
+# Purpose: Decide whether SMTP settings and recipients are enough to send email.
+- name: "Final report - Check email readiness"
+  ansible.builtin.set_fact:
+    _nativeha_report_email_ready: >-
+      {{
+        notification_email_enabled | default(false) | bool
+        and notification_email_host | default('', true) | trim | length > 0
+        and notification_email_from | default('', true) | trim | length > 0
+        and _nativeha_report_recipients | length > 0
+        and (
+          notification_email_username | default('', true) | trim | length == 0
+          or notification_email_password | default('', true) | trim | length > 0
+        )
+      }}
+    _nativeha_report_should_send: >-
+      {{
+        (
+          _nativeha_report_status == 'success'
+          and notification_email_send_success | default(true) | bool
+        )
+        or (
+          _nativeha_report_status != 'success'
+          and notification_email_send_failure | default(true) | bool
+        )
+      }}
+
+# Purpose: Send the final HTML report through the configured SMTP server.
+- name: "Final report - Send HTML email"
+  community.general.mail:
+    host: "{{ notification_email_host }}"
+    port: "{{ notification_email_port | int }}"
+    secure: "{{ notification_email_secure | default('try') }}"
+    username: "{{ notification_email_username if (notification_email_username | default('', true) | trim | length > 0) else omit }}"
+    password: "{{ notification_email_password if (notification_email_password | default('', true) | trim | length > 0) else omit }}"
+    from: "{{ notification_email_from }}"
+    to: "{{ _nativeha_report_recipients }}"
+    subject: >-
+      {{ notification_email_subject_prefix | default('[MQ NativeHA]') }}
+      {{ _nativeha_report_status | upper }} - {{ _nativeha_report_title }} -
+      {{ _nativeha_report_env }} - {{ _nativeha_report_targets }}
+    subtype: html
+    body: "{{ lookup('ansible.builtin.template', 'report.html.j2') }}"
+    timeout: "{{ notification_email_timeout | default(20) | int }}"
+  register: _nativeha_report_mail_result
+  failed_when: false
+  no_log: "{{ notification_email_no_log | default(true) | bool }}"
+  when:
+    - _nativeha_report_email_ready | bool
+    - _nativeha_report_should_send | bool
+
+# Purpose: Tell the job log whether the email was attempted or skipped.
+- name: "Final report - Email skipped or sent"
+  ansible.builtin.debug:
+    msg: >-
+      Final HTML email report {{
+        'sent/attempted'
+        if (_nativeha_report_mail_result is defined and not (_nativeha_report_mail_result.skipped | default(false) | bool))
+        else 'skipped'
+      }} for {{ _nativeha_report_title }}.
+      {{
+        'Set NATIVEHA_SMTP_PASSWORD or an AAP SMTP credential to enable Gmail delivery.'
+        if (notification_email_enabled | default(false) | bool and not (_nativeha_report_email_ready | bool))
+        else ''
+      }}

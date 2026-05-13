@@ -1,0 +1,52 @@
+---
+# Purpose: Check certificate inventory health and report certificates nearing expiry.
+- name: "NativeHA Certificate Monitor"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+    - ../../../nativeha_templates/global_vars/certs_control_vars.yaml
+
+  tasks:
+    # Purpose: Check certificate inventory health and report certificates nearing expiry.
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    # Purpose: Check certificate inventory health and report certificates nearing expiry.
+    - name: "Run certificate monitor workflow"
+      block:
+        # Purpose: Check certificate inventory health and report certificates nearing expiry.
+        - name: "Certificate monitor - Execute"
+          ansible.builtin.include_role:
+            name: cert_monitor
+
+        # Purpose: Check certificate inventory health and report certificates nearing expiry.
+        - name: "Certificate monitor - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        # Purpose: Check certificate inventory health and report certificates nearing expiry.
+        - name: "Certificate monitor - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        # Purpose: Check certificate inventory health and report certificates nearing expiry.
+        - name: "Certificate monitor - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Certificate Monitor"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Read the Git-backed certificate registry and report certificate
+              health, expiry, and attention items.
+
+        # Purpose: Check certificate inventory health and report certificates nearing expiry.
+        - name: "Certificate monitor - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Certificate monitor failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

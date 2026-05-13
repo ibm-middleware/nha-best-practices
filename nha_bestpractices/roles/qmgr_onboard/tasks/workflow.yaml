@@ -1,0 +1,682 @@
+---
+# Queue Manager Onboarding Workflow
+# This file holds the mutable "do the work" part of onboarding.
+# It is included from tasks/main.yaml inside a block/rescue/always
+# wrapper so git workspace cleanup happens even when a later task
+# fails.
+# Variable origins:
+# - Survey / AAP inputs: app_sys_id, mq_environment, total_volume_24h,
+# - Shared config: nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+# - Derived here: target_branch, qmgr_name, namespace, sizing, samplecertrepo zone
+# How to read variables in this workflow:
+# - Values in vars_files are global configuration. Examples:
+# - AAP survey values are treated as user intent. Examples:
+# - set_fact creates runtime facts for later tasks. Examples:
+# - Variables starting with "_" are local helper facts used by this role only.
+# - target_repo_pr_* facts are publish metadata consumed by
+# Action contract:
+# - Onboard is create-only.
+# - qmgr_name is NOT provided by the survey.
+# - seq_number is auto-discovered from Git; qmgr_name is first set in Step 3
+# Target directory structure (Base + Overlays):
+
+# Purpose: Store the automation branch name that will be pushed.
+- name: "Step 1 - Set target repo URL, branch, and QM root"
+  ansible.builtin.set_fact:
+    env_upper: "{{ _qmgr_onboard_env }}"
+    git_repo_url: "{{ env_repo_map[_qmgr_onboard_env] }}"
+    target_branch: "{{ env_branch_map[_qmgr_onboard_env] }}"
+    argocd_app_root_rel: >-
+      {{
+        ('argocd_mq_applications/' ~ qmgr_env_subdir_map[_qmgr_onboard_env])
+        if _qmgr_onboard_env in (qmgr_env_subdir_map | default({}))
+        else 'argocd_mq_applications'
+      }}
+    qmgr_root_rel: >-
+      {{
+        ('queue_managers/' ~ qmgr_env_subdir_map[_qmgr_onboard_env])
+        if _qmgr_onboard_env in (qmgr_env_subdir_map | default({}))
+        else 'queue_managers'
+      }}
+  vars:
+    _qmgr_onboard_env: "{{ mq_environment | default('DEV') | string | upper | trim }}"
+
+# Purpose: Choose optional feature toggles from inputs and defaults.
+- name: "Step 1 - Resolve optional feature toggles"
+  ansible.builtin.set_fact:
+    mq_webui_enabled: "{{ enable_webui | default(web_enabled | default(false)) | bool }}"
+    mq_prometheus_exporter_enabled: "{{ enable_prometheus_monitor | default(false) | bool }}"
+    mq_operator_metrics_enabled: "{{ enable_metrics | default(false) | bool }}"
+    mq_cert_delivery_backend_effective: "{{ mq_cert_delivery_backend | default('openshift_secret') | lower }}"
+    mq_vso_secret_sync_enabled: "{{ enable_vso_secret_sync | default(false) | bool }}"
+
+# Purpose: Stop unsupported combinations of certificate backend and VSO sync settings.
+- name: "Step 1 - Validate certificate delivery and VSO switch contract"
+  ansible.builtin.assert:
+    that:
+      - mq_cert_delivery_backend_effective in ['openshift_secret', 'samplecertrepo']
+      - not (mq_vso_secret_sync_enabled | bool and mq_cert_delivery_backend_effective != 'samplecertrepo')
+      - mq_cert_delivery_backend_effective != 'samplecertrepo' or mq_vso_secret_sync_enabled | bool
+    fail_msg: >-
+      Invalid certificate delivery configuration. Use
+      mq_cert_delivery_backend=openshift_secret with enable_vso_secret_sync=false
+      for direct OpenShift Secret injection. Use mq_cert_delivery_backend=samplecertrepo
+      with enable_vso_secret_sync=true only when VSO is approved and installed
+      to sync samplecertrepo certs into Kubernetes Secrets for MQ.
+    quiet: true
+
+# Purpose: Confirm client trust Secret names are valid Kubernetes names.
+- name: "Step 1 - Validate client trust naming"
+  ansible.builtin.assert:
+    that:
+      - (mq_client_trust_source_name | default('clientcerts')) is match('^[a-z0-9]+$')
+      - (mq_client_trust_secret_suffix | default('client-certs')) is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+      - (mq_client_trust_default_ca_item | default('example.lab-ca.crt')) is match('^[A-Za-z0-9._-]+$')
+      - not (mq_vso_secret_sync_enabled | bool) or (_client_trust_samplecertrepo_path_for_validation | length > 0)
+      - >-
+        not (mq_vso_secret_sync_enabled | bool)
+        or (_client_trust_samplecertrepo_path_for_validation is not search('(^/|/$|//|\\.\\.)'))
+    fail_msg: >-
+      Invalid client trust naming. The MQ pki.trust name must be lowercase
+      alphanumeric, the Secret suffix must be a DNS label, the default CA item
+      must be a simple Secret key filename, and when VSO is enabled the shared
+      samplecertrepo path must be a relative KV path without duplicate or trailing
+      slashes.
+    quiet: true
+  vars:
+    _client_trust_samplecertrepo_path_for_validation: >-
+      {{
+        mq_client_trust_samplecertrepo_shared_path
+        | default((app_sys_id | string | lower | trim) ~ '/ibm-mq/shared')
+        | string
+        | trim
+      }}
+
+# Purpose: Use a run-specific checkout so parallel jobs do not share files.
+- name: "Step 1 - Isolate git working directory for this run"
+  ansible.builtin.set_fact:
+    git_work_dir_base: "{{ git_work_dir }}"
+    git_work_dir: "{{ git_work_dir }}/qmgr_{{ env_upper | lower }}_{{ now(utc=false, fmt='%Y%m%d%H%M%S') }}_{{ 1000000 | random }}"
+
+# Purpose: Ensure the temporary Git checkout parent directory exists.
+- name: "Step 1 - Ensure git work base exists"
+  ansible.builtin.file:
+    path: "{{ git_work_dir_base }}"
+    state: directory
+    mode: "0755"
+  check_mode: false
+
+# Purpose: Clone the target repository and set the automation Git identity.
+- name: "Step 1 - Clone and configure git repo"
+  ansible.builtin.include_tasks: git_operations.yaml
+
+# Purpose: Serialize direct-mode onboarding before discovering the next sequence number.
+- name: "Step 1 - Acquire direct publish lock"
+  ansible.builtin.include_role:
+    name: gitops_publish
+    tasks_from: direct_publish_lock_acquire
+  vars:
+    direct_publish_lock_sync_after_acquire: true
+
+# Purpose: Auto discover sequence number.
+- name: "Step 2 - Auto-discover sequence number"
+  block:
+    # Purpose: Open or update the pull request for the prepared GitOps change.
+    - name: "Create - Derive prefix and env_code from app_sys_id"
+      ansible.builtin.set_fact:
+        app_prefix: "{{ app_sys_id | string | lower | trim }}"
+        env_code: "{{ env_qmgr_abbr[env_upper] | lower }}"
+
+    # Purpose: Find the next queue manager sequence before names are derived.
+    - name: "Create - Discover next free sequence from Git"
+      ansible.builtin.include_tasks: discover_sequence.yaml
+      # sets: seq_number (e.g. "001", "002", ...)
+
+# Purpose: Calculate queue manager and namespace names from validated inputs.
+- name: "Step 3 - Compute derived identity"
+  ansible.builtin.set_fact:
+    app_prefix: "{{ app_sys_id | string | lower | trim }}"
+    env_lower: "{{ env_upper | lower }}"
+    env_code: "{{ env_qmgr_abbr[env_upper] | lower }}"
+    env_ns_code: "{{ env_namespace_abbr[env_upper] }}"
+    # Instance type is derived from the shared environment map so qmgr and
+    # certificate automation agree.
+    instance_type: "{{ env_instance_type_map[env_upper] }}"
+    sequence_number: "{{ seq_number | default('001') }}"
+    _zone: "{{ 'hra' if app_sys_id | string | lower | trim in samplecertrepo_security_zones.hra.apps else 'sra' }}"
+
+# Purpose: Choose the samplecertrepo namespace and mount for this environment.
+- name: "Step 3 - Compute samplecertrepo namespace and mount"
+  ansible.builtin.set_fact:
+    samplecertrepo_namespace: "{{ samplecertrepo_security_zones[_zone].label }}"
+    samplecertrepo_mount: "{{ samplecertrepo_security_zones[_zone].mount }}"
+
+# Purpose: Calculate requested persistent storage from message volume and size.
+- name: "Step 3 - Compute storage requirement"
+  ansible.builtin.set_fact:
+    # total_volume_24h is a message COUNT (e.g. '1m' = 1,000,000 messages).
+    # Uses parse_volume_count (SI decimal: 1k=1000, 1m=1000000).
+    _parsed_volume: "{{ total_volume_24h | parse_volume_count | int }}"
+    # avg_msg_size is a BYTE size (e.g. '4k' = 4096 bytes).
+    # Uses human_to_bytes (IEC binary: 1k=1024).
+    _parsed_size: "{{ (avg_msg_size | human_to_bytes) | int }}"
+
+# Purpose: Confirm positive sizing values.
+- name: "Step 3 - Validate positive sizing values"
+  ansible.builtin.assert:
+    that:
+      - _parsed_volume | int > 0
+      - _parsed_size | int > 0
+    fail_msg: |-
+      Queue manager onboarding sizing inputs are invalid.
+
+      total_volume_24h must be a positive message count such as 1k, 500k, or 1m.
+      avg_msg_size must be a positive byte size such as 4k, 1m, or 10m.
+
+      Received:
+      - total_volume_24h={{ total_volume_24h | default('missing') }} parsed={{ _parsed_volume }}
+      - avg_msg_size={{ avg_msg_size | default('missing') }} parsed={{ _parsed_size }}
+
+      No queue-manager files were generated.
+    quiet: true
+
+# Purpose: Add a 20 percent buffer to the calculated data volume.
+- name: "Step 3 - Compute base storage with 20 percent buffer"
+  ansible.builtin.set_fact:
+    _base_storage: "{{ ((_parsed_volume | int) * (_parsed_size | int) * 1.20) | int }}"
+
+# Purpose: Apply the extra storage multiplier required by CRR queue managers.
+- name: "Step 3 - Apply CRR multiplier"
+  ansible.builtin.set_fact:
+    computed_storage_bytes: >-
+      {{ ((_base_storage | int) * 2) | int if instance_type == 'nhacrr'
+         else (_base_storage | int) }}
+
+# Purpose: Choose ordered tier list from inputs and defaults.
+- name: "Step 3 - Resolve ordered tier list"
+  ansible.builtin.set_fact:
+    _tier_order: >-
+      {{
+        (sizing_order | default(['small', 'medium', 'large', 'xlarge']))
+        | select('in', sizing[env_upper].keys() | list)
+        | list
+      }}
+
+# Purpose: Choose the smallest configured MQ size tier that fits the requested load.
+- name: "Step 3 - Select best-matching size tier"
+  ansible.builtin.set_fact:
+    _matched_tier: "{{ sizing[env_upper] | get_best_mq_tier(computed_storage_bytes, _tier_order, env_upper) }}"
+
+# Purpose: Copy the selected tier CPU, memory, and storage values into named facts.
+- name: "Step 3 - Expand selected tier properties"
+  ansible.builtin.set_fact:
+    selected_size_tier: "{{ _matched_tier.name }}"
+    qmgr_size: "{{ _matched_tier.specs }}"
+
+# Purpose: Derive final queue manager, namespace, branch, and sizing facts.
+- name: "Step 3 - Compute final names and deploy settings"
+  ansible.builtin.set_fact:
+    qmgr_name: "{{ app_prefix }}{{ env_code }}{{ sequence_number }}"
+    namespace: >-
+      {{
+        custom_openshift_namespace_effective
+        if (custom_openshift_namespace_enabled | default(false) | bool)
+        else ((app_sys_id ~ '-mq-' ~ env_ns_code ~ '-' ~ sequence_number) | lower)
+      }}
+    namespace_source: >-
+      {{
+        'custom_openshift_namespace'
+        if (custom_openshift_namespace_enabled | default(false) | bool)
+        else 'derived'
+      }}
+    # target_branch already set in Step 1 from env_branch_map[env_upper].
+    mq_version: "{{ mq_versions.PROD if env_upper == 'PROD' else mq_versions.NONPROD }}"
+    license_id: "{{ license_ids.PROD if env_upper == 'PROD' else license_ids.NONPROD }}"
+    license_cluster1: "{{ 'Production' if env_upper == 'PROD' else 'NonProduction' }}"
+    storage_class_name: "{{ qmgr_size.storage_class | default('lvms-vg1') }}"
+    qmgr_name_upper: "{{ (app_prefix + env_code + sequence_number) | upper }}"
+    live_region_lower: "{{ env_region_map[env_upper] | first }}"
+
+# Purpose: Build the target GitOps path for this queue manager.
+- name: "Step 3 - Compute queue manager relative path"
+  ansible.builtin.set_fact:
+    qmgr_rel_path: "{{ qmgr_root_rel }}/{{ qmgr_name }}"
+
+# Purpose: Build a readable summary of the queue manager configuration.
+- name: "Step 4 - Computed configuration summary"
+  ansible.builtin.debug:
+    msg:
+      - "  Queue Manager : {{ qmgr_name | upper }}"
+      - "  Namespace     : {{ namespace }}"
+      - "  Namespace Src : {{ namespace_source }}"
+      - "  Environment   : {{ env_upper }}"
+      - "  Instance Type : {{ instance_type }}"
+      - "  Cert Backend  : {{ mq_cert_delivery_backend_effective }}"
+      - "  VSO Sync      : {{ mq_vso_secret_sync_enabled | bool }}"
+      - "  samplecertrepo Zone    : {{ _zone | upper }}"
+      - "  Size Tier     : {{ selected_size_tier | default('unknown') }}"
+      - "  Regions       : {{ env_region_map[env_upper] }}"
+      - "  samplecertrepo NS      : {{ samplecertrepo_namespace | default('root') }}"
+      - "  Target Branch : {{ target_branch }}"
+      - "  Target Path   : {{ qmgr_rel_path }}"
+      - "  Computed Storage: {{ computed_storage_bytes | int | human_readable }}"
+      - "  QM Storage    : {{ qmgr_size.qmgr_storage }}"
+      - "  Log Storage   : {{ qmgr_size.log_storage }}"
+
+# Purpose: Check whether the generated queue manager path already exists.
+- name: "Step 5 - Check if QM directory exists"
+  ansible.builtin.stat:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}"
+  register: _qmgr_dir
+
+# Purpose: Pick a new sequence when the first queue manager name already exists.
+- name: "Step 5 - Recompute create target if candidate already exists"
+  when:
+    - qm_action_effective == 'Create'
+    - _qmgr_dir.stat.exists
+  block:
+    # Purpose: Find another free sequence because the current queue manager path exists.
+    - name: "Create - Existing candidate detected, discover next free sequence"
+      ansible.builtin.include_tasks: discover_sequence.yaml
+
+    # Purpose: Rebuild queue manager and namespace names after the sequence number changes.
+    - name: "Create - Recompute final names after sequence increment"
+      ansible.builtin.set_fact:
+        sequence_number: "{{ seq_number }}"
+        qmgr_name: "{{ app_prefix }}{{ env_code }}{{ seq_number }}"
+        qmgr_rel_path: "{{ qmgr_root_rel }}/{{ app_prefix }}{{ env_code }}{{ seq_number }}"
+        namespace: >-
+          {{
+            custom_openshift_namespace_effective
+            if (custom_openshift_namespace_enabled | default(false) | bool)
+            else ((app_sys_id ~ '-mq-' ~ env_ns_code ~ '-' ~ seq_number) | lower)
+          }}
+        namespace_source: >-
+          {{
+            'custom_openshift_namespace'
+            if (custom_openshift_namespace_enabled | default(false) | bool)
+            else 'derived'
+          }}
+        qmgr_name_upper: "{{ (app_prefix + env_code + seq_number) | upper }}"
+
+    # Purpose: Print the sequence number chosen after the existing path check.
+    - name: "Create - Log sequence bump"
+      ansible.builtin.debug:
+        msg: >-
+          Candidate queue manager already existed, so create advanced to
+          {{ qmgr_name | upper }}.
+# Purpose: Choose deployment regions from the environment map.
+- name: "Step 7 - Compute target regions"
+  ansible.builtin.set_fact:
+    _target_regions: "{{ env_region_map[env_upper] }}"
+    _app_mqsc_group_dirs: >-
+      {{
+        app_mqsc_group_dirs
+        | default([
+            '50-app-chlauth',
+            '52-app-channel',
+            '54-app-objects',
+            '56-app-authrec'
+          ])
+      }}
+
+# Purpose: Stop early if the region map cannot support the requested queue manager mode.
+- name: "Step 7 - Validate region catalog and cluster metadata"
+  ansible.builtin.assert:
+    that:
+      - _target_regions | length > 0
+      - _target_regions | difference(regions.keys() | list) | length == 0
+      - _target_regions | difference(openshift_clusters[env_upper].keys() | list) | length == 0
+    fail_msg: |-
+      Queue manager onboarding region configuration is incomplete for {{ env_upper }}.
+
+      env_region_map[{{ env_upper }}]={{ _target_regions }}
+      Missing from regions catalog: {{ _target_regions | difference(regions.keys() | list) }}
+      Missing from openshift_clusters[{{ env_upper }}]: {{ _target_regions | difference(openshift_clusters[env_upper].keys() | list) }}
+
+      Fix nativeha_qmgr_control_vars.yaml before onboarding this queue manager.
+    quiet: true
+
+# Purpose: Ensure the required output directory exists before writing files.
+- name: "Step 7 - Create base directories"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - ""
+    - "ini"
+    - "mqsc"
+    - "routes"
+    - "scripts"
+    - "secrets"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Ensure the required output directory exists before writing files.
+- name: "Step 7 - Create monitoring directory (conditional)"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/monitoring"
+    state: directory
+    mode: "0755"
+  when:
+    - qm_action_effective == 'Create'
+    - >-
+      mq_prometheus_exporter_enabled | bool
+      or mq_webui_enabled | bool
+
+# Purpose: Write the GitOps patch or kustomization file for this queue manager change.
+- name: "Step 7 - Create overlay directories per region"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}/overlays/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ _target_regions }}"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Write the GitOps patch or kustomization file for this queue manager change.
+- name: "Step 7 - Create shared overlay directories"
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ qmgr_rel_path }}/overlays/_shared/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ ['', 'patches', 'mqsc-app'] + (_app_mqsc_group_dirs | map('regex_replace', '^(.*)$', 'mqsc-app/\\1') | list) }}"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Write MQSC files into the queue manager GitOps layout.
+- name: "Step 7 - Seed app MQSC placeholder files"
+  ansible.builtin.copy:
+    content: |
+      * {{ item }}.mqsc - app MQSC placeholder
+      * No MQSC commands are defined at onboarding time.
+      * Day-2 app MQSC automation may replace or extend this file.
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/overlays/_shared/mqsc-app/{{ item }}/{{ item }}.mqsc"
+    mode: "0644"
+  loop: "{{ _app_mqsc_group_dirs }}"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Ensure each target region has an ArgoCD output directory.
+- name: "Step 7 - Ensure ArgoCD region directories exist"
+  # Dedicated environment repos keep Applications directly under
+  # argocd_mq_applications/<region>. Shared repos such as QA keep the
+  # environment split under argocd_mq_applications/<ENV>/<region>.
+  # state: directory is idempotent for repeated Create runs.
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ argocd_app_root_rel }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ _target_regions }}"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Discover core MQSC files copied into the queue manager base layout.
+- name: "Step 8 - Discover core MQSC files"
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/../../../nativeha_templates/base/mqsc"
+    patterns: "*.mqsc"
+    file_type: file
+  register: _mqsc_core_found
+  when: qm_action_effective == 'Create'
+
+# Purpose: Discover INI files copied into the queue manager base layout.
+- name: "Step 8 - Discover INI files"
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/../../../nativeha_templates/base/ini"
+    patterns: "*"
+    file_type: file
+  register: _ini_found
+  when: qm_action_effective == 'Create'
+
+# Purpose: Discover utility scripts copied into the queue manager base layout.
+- name: "Step 8 - Discover script files"
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/../../../nativeha_templates/base/scripts"
+    patterns: "*"
+    file_type: file
+  register: _scripts_found
+  when: qm_action_effective == 'Create'
+
+# Purpose: Store the static MQSC, INI, and script file lists for base generation.
+- name: "Step 8 - Set discovered file lists"
+  ansible.builtin.set_fact:
+    mqsc_core_files: "{{ _mqsc_core_found.files | map(attribute='path') | map('basename') | sort | list }}"
+    ini_files: "{{ _ini_found.files | map(attribute='path') | map('basename') | sort | list }}"
+    script_files: "{{ _scripts_found.files | map(attribute='path') | map('basename') | sort | list }}"
+    app_mqsc_groups: >-
+      {% set groups = [] -%}
+      {% for group_dir in _app_mqsc_group_dirs -%}
+      {{ groups.append({
+          'dir': group_dir,
+          'suffix': group_dir | regex_replace('^[0-9]+-', ''),
+          'files': [group_dir ~ '.mqsc']
+      }) or '' }}
+      {%- endfor -%}
+      {{ groups }}
+  when: qm_action_effective == 'Create'
+
+# Purpose: Check generated names before they are used in Kubernetes or Git paths.
+- name: "Step 8 - Validate ConfigMap file names"
+  ansible.builtin.assert:
+    that:
+      - _invalid_configmap_files | length == 0
+    fail_msg: >-
+      Invalid ConfigMap source filenames detected: {{ _invalid_configmap_files }}.
+      File basenames must match [-._a-zA-Z0-9]+ because Kubernetes uses them
+      as ConfigMap data keys.
+  vars:
+    _configmap_source_files: "{{ mqsc_core_files + ini_files + script_files }}"
+    _invalid_configmap_files: "{{ _configmap_source_files | reject('match', '^[-._a-zA-Z0-9]+$') | list }}"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Write MQSC files into the queue manager GitOps layout.
+- name: "Step 8 - Copy MQSC files to base/mqsc"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/mqsc/"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/mqsc/"
+    mode: preserve
+  when: qm_action_effective == 'Create'
+
+# Purpose: Write INI files into the queue manager GitOps layout.
+- name: "Step 8 - Copy INI files to base/ini"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/ini/"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/ini/"
+    mode: preserve
+  when: qm_action_effective == 'Create'
+
+# Purpose: Write base GitOps files for the new queue manager.
+- name: "Step 8 - Copy utility scripts to base/scripts"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/scripts/"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/scripts/"
+    mode: preserve
+  when:
+    - qm_action_effective == 'Create'
+    - enable_scripts_configmap | default(true) | bool
+
+# Purpose: Secrets manifests into base secrets.
+- name: "Step 9 - Generate secrets manifests into base/secrets"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/secrets/{{ item.src }}"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/secrets/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - src: "serviceaccount.yaml.j2"
+      dest: "serviceaccount.yaml"
+      condition: "{{ mq_vso_secret_sync_enabled | bool }}"
+    - src: "samplecertrepo_connection.yaml.j2"
+      dest: "samplecertrepo_connection.yaml"
+      condition: "{{ mq_vso_secret_sync_enabled | bool }}"
+    - src: "samplecertrepo_auth.yaml.j2"
+      dest: "samplecertrepo_auth.yaml"
+      condition: "{{ mq_vso_secret_sync_enabled | bool }}"
+    - src: "samplecertrepo_secret_app_pki.yaml.j2"
+      dest: "samplecertrepo_secret_app_pki.yaml"
+      condition: "{{ mq_vso_secret_sync_enabled | bool }}"
+    - src: "samplecertrepo_secret_client_certs.yaml.j2"
+      dest: "samplecertrepo_secret_client_certs.yaml"
+      condition: "{{ mq_vso_secret_sync_enabled | bool }}"
+    - { src: "ibm_entitlement_dummy.yaml.j2", dest: "ibm_entitlement_dummy.yaml" }
+    - src: "samplecertrepo_secret_nha.yaml.j2"
+      dest: "samplecertrepo_secret_nha.yaml"
+      condition: "{{ (mq_vso_secret_sync_enabled | bool) and (instance_type in ['nha', 'nhacrr']) }}"
+    - src: "samplecertrepo_secret_nhacrr.yaml.j2"
+      dest: "samplecertrepo_secret_nhacrr.yaml"
+      condition: "{{ (mq_vso_secret_sync_enabled | bool) and (instance_type == 'nhacrr') }}"
+  when:
+    - qm_action_effective == 'Create'
+    - item.condition | default(true) | bool
+
+# Purpose: Base secrets kustomization yaml.
+- name: "Step 9 - Generate base/secrets/kustomization.yaml"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/secrets/secrets_kustomization.yaml.j2"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/secrets/kustomization.yaml"
+    mode: "0644"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Custom client route manifests.
+- name: "Step 9 - Generate custom client route manifests"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/routes/{{ item.src }}"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/routes/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: "custom_client_route.yaml.j2", dest: "custom_client_route.yaml" }
+    - { src: "routes_kustomization.yaml.j2", dest: "kustomization.yaml" }
+  when:
+    - qm_action_effective == 'Create'
+    - custom_client_route_enabled | default(false) | bool
+
+# Purpose: Prometheus manifests into base monitoring.
+- name: "Step 10 - Generate Prometheus manifests into base/monitoring"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/monitoring/{{ item.src }}"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/monitoring/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: "prometheus_config.yaml.j2", dest: "prometheus_config.yaml" }
+    - { src: "prometheus_deployment.yaml.j2", dest: "prometheus_deployment.yaml" }
+    - { src: "prometheus_service.yaml.j2", dest: "prometheus_service.yaml" }
+  when:
+    - qm_action_effective == 'Create'
+    - mq_prometheus_exporter_enabled | bool
+
+# Purpose: Write monitoring manifests for the queue manager.
+- name: "Step 10 - Copy WebUI config into base/monitoring"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/monitoring/mqwebuser.xml"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/monitoring/mqwebuser.xml"
+    mode: "0644"
+  when:
+    - qm_action_effective == 'Create'
+    - mq_webui_enabled | bool
+
+# Purpose: Base monitoring kustomization yaml.
+- name: "Step 10 - Generate base/monitoring/kustomization.yaml"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/monitoring/monitoring_kustomization.yaml.j2"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/monitoring/kustomization.yaml"
+    mode: "0644"
+  when:
+    - qm_action_effective == 'Create'
+    - >-
+      mq_prometheus_exporter_enabled | bool
+      or mq_webui_enabled | bool
+
+# Purpose: Store region-specific values used to render overlays.
+- name: "Step 11 - Set base manifest region defaults"
+  ansible.builtin.set_fact:
+    base_region: "{{ _target_regions | first }}"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Base queuemanager cr placeholder values.
+- name: "Step 11 - Generate base QueueManager CR (PLACEHOLDER values)"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/qmgr_templates/{{ instance_type_to_template[instance_type] }}"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/qmgr.yaml"
+    mode: "0644"
+  vars:
+    current_region: "{{ base_region }}"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Write the base kustomization that includes queue manager resources.
+- name: "Step 11 - Generate base/kustomization.yaml"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../../nativeha_templates/base/base_kustomization.yaml.j2"
+    dest: "{{ git_work_dir }}/{{ qmgr_rel_path }}/base/kustomization.yaml"
+    mode: "0644"
+  when: qm_action_effective == 'Create'
+
+# Purpose: Generate shared overlay patches used by every region.
+- name: "Step 12 - Generate shared overlay manifests"
+  ansible.builtin.include_tasks: generate_shared_overlay.yaml
+  when: qm_action_effective == 'Create'
+
+# Purpose: Generate each regional overlay for the queue manager.
+- name: "Step 12 - Generate overlay manifests per region"
+  ansible.builtin.include_tasks: generate_overlay.yaml
+  vars:
+    current_region: "{{ overlay_region }}"
+  loop: "{{ _target_regions }}"
+  loop_control:
+    loop_var: overlay_region
+  when: qm_action_effective == 'Create'
+
+# Purpose: Argocd application per region.
+- name: "Step 13 - Generate ArgoCD Application per region"
+  ansible.builtin.template:
+    src: argocd_app.yaml.j2
+    dest: >-
+      {{
+        [
+          git_work_dir,
+          argocd_app_root_rel,
+          app_region,
+          qmgr_name ~ '_' ~ app_region ~ '_argocd_app.yaml'
+        ] | path_join
+      }}
+    mode: "0644"
+  vars:
+    current_region: "{{ app_region }}"
+  loop: "{{ _target_regions }}"
+  loop_control:
+    loop_var: app_region
+  when: qm_action_effective == 'Create'
+
+# Purpose: Prepare the title, summary, and validation text for the GitOps change.
+- name: "Step 14 - Prepare create publish metadata"
+  ansible.builtin.set_fact:
+    target_repo_pr_action_slug: "qm-create"
+    target_repo_pr_action_label: "Create QM"
+    target_repo_pr_repo_path: "{{ qmgr_rel_path }}"
+    target_repo_pr_summary: >-
+      Create queue manager {{ qmgr_name | upper }} in {{ env_upper }} with
+      namespace {{ namespace }}, instance type {{ instance_type }}, and size
+      tier {{ selected_size_tier }}.
+    target_repo_pr_validation: >-
+      Generated queue manager base, shared overlay, regional overlays, and
+      ArgoCD application manifests for regions {{ _target_regions | join(', ') }}.
+  when: qm_action_effective == 'Create'
+
+# Purpose: Publish the prepared GitOps changes by pull request or direct commit.
+- name: "Step 14 - Publish target repo changes"
+  ansible.builtin.include_role:
+    name: gitops_publish
+    tasks_from: target_repo_publish
+
+# Purpose: Print created queue manager path, branch, overlays, and PR details.
+- name: "Step 14 - Onboarding complete"
+  ansible.builtin.debug:
+    msg:
+      - "   {{ qm_action_effective | upper }} COMPLETE"
+      - "  Queue Manager : {{ qmgr_name | upper }}"
+      - "  Namespace     : {{ namespace }}"
+      - "  Namespace Src : {{ namespace_source }}"
+      - "  Base Branch   : {{ target_branch }}"
+      - "  Change Mode   : {{ target_repo_pr_result.mode | default(target_repo_change_mode | default('pull_request')) }}"
+      - "  Publish Branch: {{ target_repo_pr_result.branch | default('not created') }}"
+      - "  PR URL        : {{ target_repo_pr_result.pull_request_url | default('not created') }}"
+      - "  Target Path   : {{ qmgr_rel_path }}"
+      - "  Base          : {{ qmgr_rel_path }}/base/"
+      - "  Shared Overlay: {{ qmgr_rel_path }}/overlays/_shared/"
+      - "  Overlays      : {{ _target_regions | map('regex_replace', '^(.*)$', qmgr_rel_path ~ '/overlays/\\1') | list }}"
+      - "  ArgoCD Apps   : {{ _target_regions | map('regex_replace', '^(.*)$', argocd_app_root_rel ~ '/\\1/' ~ qmgr_name ~ '_\\1_argocd_app.yaml') | list }}"

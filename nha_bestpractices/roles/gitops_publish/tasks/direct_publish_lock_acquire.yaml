@@ -1,0 +1,150 @@
+---
+# Acquire a lightweight remote Git lock for direct publishes. The lock is a
+# branch that can only be created when absent, so concurrent jobs wait instead
+# of rebasing competing direct commits at the same time.
+
+- name: "Direct publish lock - Resolve mode"
+  ansible.builtin.set_fact:
+    _direct_publish_lock_mode: >-
+      {{
+        target_repo_change_mode_effective
+        | default(target_repo_change_mode | default('pull_request', true), true)
+        | lower
+        | trim
+        | regex_replace('-', '_')
+      }}
+
+- name: "Direct publish lock - Normalize mode"
+  ansible.builtin.set_fact:
+    _direct_publish_lock_mode: >-
+      {{
+        'pull_request'
+        if _direct_publish_lock_mode in ['pr', 'pullrequest', 'pull_request']
+        else 'direct'
+        if _direct_publish_lock_mode in ['direct', 'direct_commit']
+        else _direct_publish_lock_mode
+      }}
+
+- name: "Direct publish lock - Resolve branch"
+  ansible.builtin.set_fact:
+    _direct_publish_lock_enabled: >-
+      {{
+        _direct_publish_lock_mode == 'direct'
+        and (target_repo_direct_lock_enabled | default(true) | bool)
+      }}
+    _direct_publish_lock_branch: >-
+      nativeha-lock/{{
+        target_branch
+        | string
+        | lower
+        | regex_replace('[^a-z0-9._/-]+', '-')
+        | regex_replace('/+', '/')
+        | regex_replace('^/+', '')
+        | regex_replace('/+$', '')
+      }}
+    _direct_publish_lock_retries: "{{ target_repo_direct_lock_retries | default(60) | int }}"
+    _direct_publish_lock_delay: "{{ target_repo_direct_lock_delay | default(10) | int }}"
+
+- name: "Direct publish lock - Capture lock commit"
+  ansible.builtin.command:
+    argv: ["git", "rev-parse", "HEAD"]
+  args:
+    chdir: "{{ git_work_dir }}"
+  register: _direct_publish_lock_head
+  changed_when: false
+  check_mode: false
+  when:
+    - _direct_publish_lock_enabled | bool
+    - not (_direct_publish_lock_acquired | default(false) | bool)
+
+- name: "Direct publish lock - Acquire remote branch"
+  ansible.builtin.command:
+    argv:
+      - git
+      - push
+      - "--porcelain"
+      - "--force-with-lease=refs/heads/{{ _direct_publish_lock_branch }}:"
+      - origin
+      - "HEAD:refs/heads/{{ _direct_publish_lock_branch }}"
+  args:
+    chdir: "{{ git_work_dir }}"
+  register: _direct_publish_lock_push
+  changed_when: >-
+    _direct_publish_lock_push.rc == 0
+    and (
+      (_direct_publish_lock_push.stderr | default('') ~ ' ' ~
+       _direct_publish_lock_push.stdout | default('')) is search('\\[new branch\\]')
+    )
+  failed_when: false
+  check_mode: false
+  until: >-
+    _direct_publish_lock_push.rc == 0
+    and (
+      (_direct_publish_lock_push.stderr | default('') ~ ' ' ~
+       _direct_publish_lock_push.stdout | default('')) is search('\\[new branch\\]')
+    )
+  retries: "{{ _direct_publish_lock_retries }}"
+  delay: "{{ _direct_publish_lock_delay }}"
+  when:
+    - _direct_publish_lock_enabled | bool
+    - not (_direct_publish_lock_acquired | default(false) | bool)
+
+- name: "Direct publish lock - Fail if unavailable"
+  ansible.builtin.fail:
+    msg: >-
+      Could not acquire direct publish lock {{ _direct_publish_lock_branch }}
+      for {{ target_branch }} after {{
+      (_direct_publish_lock_retries | int) * (_direct_publish_lock_delay | int)
+      }} seconds. Another AAP job may still be publishing to this branch. Git
+      output: {{
+      (_direct_publish_lock_push.stderr | default('') ~ ' ' ~
+       _direct_publish_lock_push.stdout | default('')) | trim
+      }}
+  when:
+    - _direct_publish_lock_enabled | bool
+    - not (_direct_publish_lock_acquired | default(false) | bool)
+    - >-
+      _direct_publish_lock_push.rc != 0
+      or (
+        (_direct_publish_lock_push.stderr | default('') ~ ' ' ~
+         _direct_publish_lock_push.stdout | default('')) is not search('\\[new branch\\]')
+      )
+
+- name: "Direct publish lock - Mark acquired"
+  ansible.builtin.set_fact:
+    _direct_publish_lock_acquired: true
+    _direct_publish_lock_sha: "{{ _direct_publish_lock_head.stdout | trim }}"
+  when:
+    - _direct_publish_lock_enabled | bool
+    - not (_direct_publish_lock_acquired | default(false) | bool)
+    - _direct_publish_lock_push.rc == 0
+    - >-
+      (_direct_publish_lock_push.stderr | default('') ~ ' ' ~
+       _direct_publish_lock_push.stdout | default('')) is search('\\[new branch\\]')
+
+- name: "Direct publish lock - Sync after acquire"
+  ansible.builtin.command:
+    argv: ["git", "pull", "--rebase", "origin", "{{ target_branch }}"]
+  args:
+    chdir: "{{ git_work_dir }}"
+  register: _direct_publish_lock_sync
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - _direct_publish_lock_acquired | default(false) | bool
+    - direct_publish_lock_sync_after_acquire | default(false) | bool
+
+- name: "Direct publish lock - Fail if sync after acquire failed"
+  ansible.builtin.fail:
+    msg: >-
+      Acquired direct publish lock {{ _direct_publish_lock_branch }}, but could
+      not sync {{ target_branch }} before continuing. Git output:
+      {{
+      (_direct_publish_lock_sync.stderr | default('') ~ ' ' ~
+       _direct_publish_lock_sync.stdout | default('')) | trim
+      }}
+  when:
+    - _direct_publish_lock_acquired | default(false) | bool
+    - direct_publish_lock_sync_after_acquire | default(false) | bool
+    - _direct_publish_lock_sync.rc != 0

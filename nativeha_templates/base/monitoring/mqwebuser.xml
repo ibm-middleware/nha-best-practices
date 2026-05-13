@@ -2,7 +2,7 @@
 <server>
     <featureManager>
         <!-- Enables standard WebSphere Liberty basic security registry instead of the OS PAM registry -->
-        <feature>appSecurity-2.0</feature>
+        <feature>apQA3curity-2.0</feature>
     </featureManager>
 
     <!-- Define the Basic Registry for MQ Console Authentication -->

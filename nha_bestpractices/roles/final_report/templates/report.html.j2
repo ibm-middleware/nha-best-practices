@@ -1,0 +1,461 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { margin: 0; padding: 0; background: #fbf9f4; color: #053b33; font-family: Arial, Helvetica, sans-serif; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 24px; }
+    .panel { background: #ffffff; border: 1px solid #e4ddd3; border-radius: 8px; overflow: hidden; }
+    .header { padding: 24px 28px; background: #053b33; color: #ffffff; border-top: 6px solid #ff7540; }
+    .title { margin: 0; font-size: 24px; line-height: 1.25; font-weight: 700; }
+    .subtitle { margin: 8px 0 0; font-size: 14px; color: #b8e0d5; }
+    .badge { display: inline-block; padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: 0; text-transform: uppercase; }
+    .badge.success { background: #b8e0d5; color: #053b33; }
+    .badge.failed { background: #ffffff; color: #ff7540; }
+    .body { padding: 24px 28px 28px; }
+    .grid { width: 100%; border-collaQA3: collaQA3; margin: 16px 0 24px; }
+    .grid td { width: 25%; padding: 14px; border: 1px solid #e4ddd3; vertical-align: top; }
+    .label { margin: 0 0 4px; color: #5e5a54; font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
+    .value { margin: 0; color: #053b33; font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+    h2 { margin: 26px 0 10px; font-size: 18px; color: #0e5447; }
+    p { font-size: 14px; line-height: 1.55; }
+    table.data { width: 100%; border-collaQA3: collaQA3; margin: 10px 0 20px; font-size: 13px; }
+    table.data th { background: #0e5447; color: #ffffff; text-align: left; padding: 10px; border: 1px solid #0e5447; }
+    table.data td { padding: 10px; border: 1px solid #e4ddd3; vertical-align: top; overflow-wrap: anywhere; }
+    .records { margin: 10px 0 22px; }
+    .record { margin: 10px 0; padding: 12px 14px; background: #ffffff; border: 1px solid #e4ddd3; border-left: 4px solid #0e5447; border-radius: 6px; }
+    .record-title { margin: 0 0 10px; color: #053b33; font-size: 15px; font-weight: 700; line-height: 1.35; }
+    table.kv { width: 100%; border-collaQA3: collaQA3; font-size: 13px; }
+    table.kv th { width: 170px; padding: 8px; background: #fbf9f4; border: 1px solid #e4ddd3; color: #5e5a54; text-align: left; vertical-align: top; }
+    table.kv td { padding: 8px; border: 1px solid #e4ddd3; vertical-align: top; overflow-wrap: anywhere; }
+    .mono { font-family: Consolas, Menlo, monospace; font-size: 12px; }
+    .muted { color: #5e5a54; }
+    .error { background: #fff3ee; border: 1px solid #ff7540; color: #7c2d12; padding: 14px; border-radius: 6px; white-space: pre-wrap; }
+    .ok { color: #0e5447; font-weight: 700; }
+    .warn { color: #645120; font-weight: 700; }
+    .status-pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: 0; }
+    .status-healthy, .status-passed, .status-active { background: #d8f3e6; color: #075c43; }
+    .status-attention, .status-expiring-soon, .status-repair-backend { background: #fff4cc; color: #6f5200; }
+    .status-expired, .status-missing, .status-corrupt, .status-failed, .status-revoked, .status-desync { background: #ffe0d8; color: #8a2c17; }
+    .summary-cards { width: 100%; border-collaQA3: collaQA3; margin: 10px 0 18px; }
+    .summary-cards td { padding: 12px; border: 1px solid #e4ddd3; background: #fbf9f4; }
+    .footer { margin-top: 22px; padding-top: 14px; border-top: 1px solid #e4ddd3; color: #5e5a54; font-size: 12px; }
+  </style>
+</head>
+<body>
+  {% macro nativeha_cert_expires(cert) -%}
+    {%- set raw = cert.not_after | default('', true) | string | trim -%}
+    {%- if raw | length == 0 -%}
+      unknown
+    {%- elif raw is match('^[0-9]{14}Z$') -%}
+      {{ (raw | to_datetime('%Y%m%d%H%M%SZ')).strftime('%Y-%m-%d %H:%M:%S UTC') }}
+    {%- else -%}
+      {{ raw | e }}
+    {%- endif -%}
+    {% if cert.days_remaining is defined and (cert.days_remaining | string | trim | length > 0) %} ({{ cert.days_remaining | e }} days){% endif -%}
+  {%- endmacro %}
+  {% macro nativeha_cert_backend_detail(result, cert, cert_type) -%}
+    {%- set backend = cert.delivery_backend | default(result.backend | default(cert_delivery_backend_effective | default('unknown', true), true), true) | string | trim -%}
+    {%- set subpath = cert_type_samplecertrepo_subpath[cert_type] if cert_type_samplecertrepo_subpath is defined and cert_type in cert_type_samplecertrepo_subpath else '' -%}
+    {%- if backend == 'samplecertrepo' -%}
+      {%- set samplecertrepo_base = result.samplecertrepo_base_path | default(samplecertrepo_cert_base_path | default('', true), true) | string | trim -%}
+      {%- set samplecertrepo_path = cert.samplecertrepo_path | default((samplecertrepo_base ~ '/' ~ subpath) if (samplecertrepo_base | length > 0 and subpath | length > 0) else 'path not captured', true) -%}
+      samplecertrepo: {{ samplecertrepo_path | e }}
+    {%- elif backend in ['openshift_secret', 'openshift-secret'] -%}
+      {%- set qmgr_for_secret = result.qmgr_name | default(qmgr_name | default('', true), true) | string | trim -%}
+      {%- set secret_name = cert.openshift_secret | default((qmgr_for_secret ~ '-' ~ subpath) if (qmgr_for_secret | length > 0 and subpath | length > 0) else 'secret not captured', true) -%}
+      OpenShift Secret: {{ secret_name | e }}
+      {%- set backend_regions = result.target_regions | default(target_regions | default([], true), true) -%}
+      {%- if backend_regions | length > 0 -%}
+        <br><span class="muted">Regions: {{ backend_regions | join(', ') | e }}</span>
+      {%- endif -%}
+    {%- else -%}
+      {{ backend | default('unknown', true) | e }}
+    {%- endif -%}
+  {%- endmacro %}
+  {% macro nativeha_cert_sans(cert) -%}
+    {%- set sans = cert.subject_alt_name | default([], true) -%}
+    {%- if sans is string -%}
+      {{ sans | default('not captured', true) | e }}
+    {%- elif sans | length > 0 -%}
+      {%- for san in sans -%}
+        {{ san | e }}{% if not loop.last %}<br>{% endif %}
+      {%- endfor -%}
+    {%- else -%}
+      not captured
+    {%- endif -%}
+  {%- endmacro %}
+  <div class="wrap">
+    <div class="panel">
+      {% set _nativeha_header_bg = '#053b33' %}
+      {% set _nativeha_subtitle_color = '#b8e0d5' %}
+      {% set _nativeha_badge_bg = '#b8e0d5' if _nativeha_report_status == 'success' else '#ffffff' %}
+      {% set _nativeha_badge_color = '#053b33' if _nativeha_report_status == 'success' else '#ff7540' %}
+      <div class="header" style="padding:24px 28px;background:{{ _nativeha_header_bg }};color:#ffffff;border-top:6px solid #ff7540;">
+        <p>
+          <span class="badge {{ 'success' if _nativeha_report_status == 'success' else 'failed' }}" style="display:inline-block;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:0;text-transform:uppercase;background:{{ _nativeha_badge_bg }};color:{{ _nativeha_badge_color }};">
+            {{ _nativeha_report_status | upper }}
+          </span>
+        </p>
+        <h1 class="title" style="margin:0;font-size:24px;line-height:1.25;font-weight:700;color:#ffffff;">{{ _nativeha_report_title | e }}</h1>
+        <p class="subtitle" style="margin:8px 0 0;font-size:14px;color:{{ _nativeha_subtitle_color }};">MQ NativeHA automation final report</p>
+      </div>
+
+      <div class="body">
+        <table class="grid">
+          <tr>
+            <td>
+              <p class="label">Environment</p>
+              <p class="value">{{ _nativeha_report_env | e }}</p>
+            </td>
+            {% if _nativeha_report_show_app | default(true) | bool %}
+            <td>
+              <p class="label">Application</p>
+              <p class="value">{{ _nativeha_report_app | e }}</p>
+            </td>
+            {% endif %}
+            <td>
+              <p class="label">Queue Manager Scope</p>
+              <p class="value">{{ _nativeha_report_targets | e }}</p>
+            </td>
+            <td>
+              <p class="label">Job Started</p>
+              <p class="value">{{ _nativeha_report_started_at | e }}</p>
+            </td>
+          </tr>
+        </table>
+
+        <h2>Business Summary</h2>
+        <p>
+          {{
+            _nativeha_report_summary
+            | e
+          }}
+        </p>
+        {% if target_repo_pr_validation is defined and (target_repo_pr_validation | string | trim | length > 0) %}
+        <p class="muted">{{ target_repo_pr_validation | e }}</p>
+        {% endif %}
+
+        {% if _nativeha_report_status != 'success' %}
+        <h2>What Happened</h2>
+        <div class="error">
+          {{
+            _nativeha_report_error
+            | e
+          }}
+        </div>
+        {% endif %}
+
+        {% if nativeha_report_diagnostic_results is defined and (nativeha_report_diagnostic_results | length > 0) %}
+        <h2>Diagnostics</h2>
+        <table class="data">
+          <tr><th>Target</th><th>Check</th><th>Status</th><th>Detail</th></tr>
+          {% for result in nativeha_report_diagnostic_results %}
+          {% set diagnostic_status = result.status | default('unknown') | string | lower | replace('_', '-') %}
+          <tr>
+            <td>{{ result.target | default(result.qmgr_name | default('diagnostic')) | e }}</td>
+            <td>{{ result.check | default(result.mode | default('check')) | e }}</td>
+            <td><span class="status-pill status-{{ diagnostic_status }}">{{ result.status | default('unknown') | e }}</span></td>
+            <td>{{ result.detail | default('not captured') | e }}</td>
+          </tr>
+          {% endfor %}
+        </table>
+        {% endif %}
+
+        <h2>Execution Details</h2>
+        <table class="data">
+          <tr><th>Item</th><th>Value</th></tr>
+          <tr><td>Playbook</td><td>{{ ansible_play_name | default(_nativeha_report_title) | e }}</td></tr>
+          <tr><td>AAP Job ID</td><td>{{ _nativeha_report_job_id | e }}</td></tr>
+          <tr><td>Requested By</td><td>{{ _nativeha_report_requested_by | e }}</td></tr>
+          <tr><td>Started At</td><td>{{ _nativeha_report_started_at | e }}</td></tr>
+          {% if _nativeha_report_show_gitops_details | bool %}
+          <tr><td>Target Repo</td><td>{{ git_repo_url | e }}</td></tr>
+          <tr><td>Publish Branch</td><td>{{ target_repo_pr_result.branch | default('not created') | e }}</td></tr>
+          <tr><td>Pull Request</td><td>{{ target_repo_pr_result.pull_request_url | default('not created') | e }}</td></tr>
+          {% endif %}
+        </table>
+
+        {% if selected_size_tier is defined or _upgrade_version is defined or qmgr_restart_at is defined or requested_live_region is defined %}
+        <h2>Queue Manager Change</h2>
+        <table class="data">
+          <tr><th>Area</th><th>Detail</th></tr>
+          {% if selected_size_tier is defined %}
+          <tr>
+            <td>Sizing</td>
+            <td>
+              Tier {{ selected_size_tier | e }}
+              {% if qmgr_size is defined %}
+              with requests {{ qmgr_size.request_cpu | default('n/a') | e }}/{{ qmgr_size.request_memory | default('n/a') | e }},
+              limits {{ qmgr_size.limits_cpu | default('n/a') | e }}/{{ qmgr_size.limits_memory | default('n/a') | e }},
+              storage {{ qmgr_size.qmgr_storage | default('n/a') | e }}/{{ qmgr_size.log_storage | default('n/a') | e }}.
+              {% endif %}
+            </td>
+          </tr>
+          {% endif %}
+          {% if _upgrade_version is defined %}
+          <tr><td>Image Upgrade</td><td>Version {{ _upgrade_version | e }} using {{ _upgrade_image | default('image not resolved') | e }}</td></tr>
+          {% endif %}
+          {% if qmgr_restart_at is defined %}
+          <tr>
+            <td>Restart</td>
+            <td>
+              {{ qmgr_restart_at | e }} for regions {{ _restart_target_regions | default([]) | join(', ') | e }}.
+            </td>
+          </tr>
+          <tr><td>Reason</td><td>{{ qmgr_restart_reason | default('not supplied') | e }}</td></tr>
+          {% endif %}
+          {% if requested_live_region is defined %}
+          <tr><td>CRR Role Switch</td><td>Requested live region: {{ requested_live_region | e }}. Stage: {{ role_switch_stage | default('not resolved') | e }}</td></tr>
+          {% endif %}
+        </table>
+        {% endif %}
+
+        {% if nativeha_report_app_mqsc_results is defined and (nativeha_report_app_mqsc_results | length > 0) %}
+        <h2>Application MQ Objects</h2>
+        <div class="records">
+          {% for result in nativeha_report_app_mqsc_results %}
+          <div class="record">
+            <p class="record-title">{{ result.qmgrs | default([]) | join(', ') | e }} / {{ result.group | default('unknown') | e }}</p>
+            <table class="kv">
+              <tr><th>Queue Managers</th><td>{{ result.qmgrs | default([]) | join(', ') | e }}</td></tr>
+              <tr><th>MQSC Group</th><td>{{ result.group | default('unknown') | e }}</td></tr>
+              <tr><th>Commands</th><td>{{ result.command_count | default('0') | e }} logical command(s) from {{ result.active_line_count | default('0') | e }} active line(s)</td></tr>
+              <tr><th>Activation</th><td>{{ result.activation_strategy | default(result.apply_strategy | default('unknown')) | e }}</td></tr>
+              <tr>
+                <th>Restart</th>
+                <td>
+                  {% if result.restart_at | default('not requested') != 'not requested' %}
+                  {{ result.restart_at | e }} for {{ result.restart_regions | default([]) | join(', ') | e }}
+                  {% else %}
+                  not requested
+                  {% endif %}
+                </td>
+              </tr>
+              <tr><th>Delete Allowed</th><td>{{ result.allow_delete | default(false) | e }}</td></tr>
+              <tr><th>Reason</th><td>{{ result.reason | default('not supplied') | e }}</td></tr>
+              {% if result.file_paths is defined and (result.file_paths | length > 0) %}
+              <tr><th>MQSC Files</th><td class="mono">{% for path in result.file_paths %}{{ path | e }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td></tr>
+              {% endif %}
+              {% if result.restart_patch_paths is defined and (result.restart_patch_paths | length > 0) %}
+              <tr><th>Restart Patches</th><td class="mono">{% for path in result.restart_patch_paths %}{{ path | e }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td></tr>
+              {% endif %}
+            </table>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if nativeha_report_client_trust_results is defined and (nativeha_report_client_trust_results | length > 0) %}
+        <h2>Client/Signer Trust</h2>
+        <div class="records">
+          {% for result in nativeha_report_client_trust_results %}
+          <div class="record">
+            <p class="record-title">{{ result.qmgr_name | upper | e }} / {{ result.alias | default('client trust') | e }}</p>
+            <table class="kv">
+              <tr><th>Queue Manager</th><td>{{ result.qmgr_name | upper | e }}</td></tr>
+              <tr><th>Namespace</th><td>{{ result.namespace | default('unknown') | e }}</td></tr>
+              <tr><th>Storage Model</th><td>{{ result.storage_model | default('OpenShift Secret stores PEM; GitOps stores only QueueManager trust reference') | e }}</td></tr>
+              <tr><th>Trust Source</th><td>{{ result.source_name | default('clientcerts') | e }}</td></tr>
+              <tr><th>Backend</th><td>{{ result.backend | default('openshift_secret') | e }}</td></tr>
+              <tr><th>Kubernetes Secret</th><td>{{ result.secret_name | default('not captured') | e }}</td></tr>
+              {% if result.samplecertrepo_path | default('', true) | length > 0 %}
+              <tr><th>samplecertrepo Path</th><td>{{ result.samplecertrepo_path | e }}</td></tr>
+              {% endif %}
+              <tr><th>Alias</th><td>{{ result.alias | default('not captured') | e }}</td></tr>
+              <tr><th>Secret Item Key</th><td>{{ result.secret_key | default('not captured') | e }}</td></tr>
+              <tr><th>All Trust Items</th><td>{{ result.get('items', []) | join(', ') | e }}</td></tr>
+              <tr><th>Certificate Blocks</th><td>{{ result.certificate_blocks | default('0') | e }}</td></tr>
+              <tr><th>Regions</th><td>{{ result.regions | default([]) | join(', ') | e }}</td></tr>
+              <tr><th>GitOps Validation</th><td>{{ result.gitops_validation | default('not captured') | e }}</td></tr>
+              <tr><th>GitOps Patch</th><td class="mono">{{ result.target_repo_patch | default('not captured') | e }}</td></tr>
+              <tr><th>Kustomization</th><td class="mono">{{ result.kustomization | default('not captured') | e }}</td></tr>
+            </table>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        {% set cert_action_labels = {
+          'skip': 'already valid',
+          'request_new': 'issued new certificate',
+          'renew': 'renewed certificate',
+          'repair_backend': 'repaired backend delivery'
+        } %}
+        {% if nativeha_report_cert_results is defined and (nativeha_report_cert_results | length > 0) %}
+        <h2>Certificate Lifecycle</h2>
+        <div class="records">
+          {% for result in nativeha_report_cert_results %}
+          {% for cert_type, cert in result.certs.items() %}
+          <div class="record">
+            <p class="record-title">{{ result.qmgr_name | upper | e }} / {{ cert_type | e }}</p>
+            <table class="kv">
+              <tr><th>Queue Manager</th><td>{{ result.qmgr_name | upper | e }}</td></tr>
+              <tr><th>Namespace</th><td>{{ result.namespace | default('unknown') | e }}</td></tr>
+              <tr><th>Common Name</th><td>{{ cert.common_name | default(cert.subject.commonName | default('not captured', true), true) | e }}</td></tr>
+              <tr><th>SANs</th><td>{{ nativeha_cert_sans(cert) }}</td></tr>
+              <tr><th>Backend Detail</th><td>{{ nativeha_cert_backend_detail(result, cert, cert_type) }}</td></tr>
+              <tr><th>Status</th><td>{{ cert.status | default('unknown') | e }}</td></tr>
+              {% set cert_action_value = cert.last_action | default(result.actions[cert_type].action if result.actions is defined and cert_type in result.actions else 'unknown') %}
+              <tr><th>Action</th><td>{{ cert_action_labels.get(cert_action_value, cert_action_value) | e }}</td></tr>
+              <tr><th>Expires</th><td>{{ nativeha_cert_expires(cert) }}</td></tr>
+              <tr><th>Serial</th><td class="mono">{{ cert.serial_number | default('not captured', true) | e }}</td></tr>
+              <tr><th>Registry</th><td>{{ 'enabled' if result.registry_enabled | default(false) | bool else 'disabled' }}{% if result.registry_enabled | default(false) | bool %}; {{ 'updated' if result.registry_updated | default(false) | bool else 'already current' }}{% endif %}</td></tr>
+            </table>
+          </div>
+          {% endfor %}
+          {% if result.client_trust_seed is defined and result.client_trust_seed is mapping and (result.client_trust_seed | length > 0) %}
+          <div class="record">
+            <p class="record-title">{{ result.qmgr_name | upper | e }} / {{ result.client_trust_seed.source_name | default('clientcerts') | e }}</p>
+            <table class="kv">
+              <tr><th>Queue Manager</th><td>{{ result.qmgr_name | upper | e }}</td></tr>
+              <tr><th>Namespace</th><td>{{ result.namespace | default('unknown') | e }}</td></tr>
+              <tr><th>Status</th><td>ensured</td></tr>
+              <tr><th>Backend</th><td>{{ result.client_trust_seed.backend | default('openshift_secret') | e }}</td></tr>
+              <tr><th>Kubernetes Secret</th><td>{{ result.client_trust_seed.secret_name | default('not captured') | e }}</td></tr>
+              {% if result.client_trust_seed.samplecertrepo_path | default('', true) | length > 0 %}
+              <tr><th>samplecertrepo Path</th><td>{{ result.client_trust_seed.samplecertrepo_path | e }}</td></tr>
+              {% endif %}
+              <tr><th>Default Item</th><td>{{ result.client_trust_seed.item | default('not captured') | e }}</td></tr>
+              <tr><th>Regions</th><td>{{ result.client_trust_seed.regions | default([]) | join(', ') | e }}</td></tr>
+            </table>
+          </div>
+          {% endif %}
+          {% endfor %}
+        </div>
+        {% elif registry_cert_data is defined and registry_cert_data is mapping and (registry_cert_data | length > 0) %}
+        <h2>Certificate Lifecycle</h2>
+        <div class="records">
+          {% for cert_type, cert in registry_cert_data.items() %}
+          <div class="record">
+            <p class="record-title">{{ qmgr_name | default('queue manager') | upper | e }} / {{ cert_type | e }}</p>
+            <table class="kv">
+              <tr><th>Common Name</th><td>{{ cert.common_name | default(cert.subject.commonName | default('not captured', true), true) | e }}</td></tr>
+              <tr><th>SANs</th><td>{{ nativeha_cert_sans(cert) }}</td></tr>
+              <tr><th>Status</th><td>{{ cert.status | default('unknown') | e }}</td></tr>
+              {% set cert_action_value = cert.last_action | default(cert_actions[cert_type].action if cert_actions is defined and cert_type in cert_actions else 'unknown') %}
+              <tr><th>Action</th><td>{{ cert_action_labels.get(cert_action_value, cert_action_value) | e }}</td></tr>
+              <tr><th>Expires</th><td>{{ nativeha_cert_expires(cert) }}</td></tr>
+              <tr><th>Serial</th><td class="mono">{{ cert.serial_number | default('not captured', true) | e }}</td></tr>
+              <tr><th>Backend Detail</th><td>{{ nativeha_cert_backend_detail({'backend': cert.delivery_backend | default(cert_delivery_backend_effective | default('unknown', true), true), 'qmgr_name': qmgr_name | default('', true), 'target_regions': target_regions | default([], true), 'samplecertrepo_base_path': samplecertrepo_cert_base_path | default('', true)}, cert, cert_type) }}</td></tr>
+            </table>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if _monitor_report is defined and (_monitor_report | length > 0) %}
+        <h2>Certificate Monitor Report</h2>
+        <table class="summary-cards">
+          <tr>
+            <td>
+              <p class="label">Healthy</p>
+              <p class="value">{{ _monitor_report | selectattr('status', 'equalto', 'healthy') | list | length }}</p>
+            </td>
+            <td>
+              <p class="label">Attention</p>
+              <p class="value">{{ _monitor_report | rejectattr('status', 'equalto', 'healthy') | list | length }}</p>
+            </td>
+            <td>
+              <p class="label">Total Queue Managers</p>
+              <p class="value">{{ _monitor_report | length }}</p>
+            </td>
+          </tr>
+        </table>
+        <h2>Certificate Details</h2>
+        <table class="data">
+          <tr>
+            <th>Queue Manager</th>
+            <th>Certificate</th>
+            <th>Status</th>
+            <th>Expires</th>
+            <th>Backend / Location</th>
+            <th>Last Action</th>
+          </tr>
+          {% for entry in _monitor_report %}
+          {% for cert in entry.certs | default([]) %}
+          {% set cert_status = cert.monitor_status | default(cert.status | default('unknown')) | string | lower | replace('_', '-') %}
+          <tr>
+            <td>
+              <strong>{{ entry.qmgr_name | default('unknown') | upper | e }}</strong>
+              <br><span class="muted">{{ entry.namespace | default('unknown') | e }}</span>
+            </td>
+            <td>
+              {{ cert.cert_name | default(cert.cert_type | default('unknown')) | e }}
+              <br><span class="muted">{{ cert.cert_type | default('unknown') | e }}</span>
+            </td>
+            <td>
+              <span class="status-pill status-{{ cert_status }}">{{ cert.monitor_status | default(cert.status | default('unknown')) | e }}</span>
+              {% if cert.alert_detail | default('', true) | length > 0 %}
+              <br><span class="muted">{{ cert.alert_detail | e }}</span>
+              {% endif %}
+            </td>
+            <td>{{ nativeha_cert_expires({'not_after': cert.not_after | default('', true), 'days_remaining': cert.days_remaining | default('', true)}) }}</td>
+            <td>
+              {{ cert.backend | default(entry.backend | default('unknown')) | e }}
+              {% if cert.backend_location | default('', true) | length > 0 %}
+              <br><span class="muted">{{ cert.backend_location | e }}</span>
+              {% endif %}
+            </td>
+            <td>
+              {{ cert.last_action | default('not captured', true) | e }}
+              <br><span class="muted">{{ cert.last_action_date | default(entry.last_updated | default('not captured'), true) | e }}</span>
+            </td>
+          </tr>
+          {% endfor %}
+          {% endfor %}
+        </table>
+        {% set monitor_attention_entries = _monitor_report | rejectattr('status', 'equalto', 'healthy') | list %}
+        {% if monitor_attention_entries | length == 0 %}
+        <p class="ok">All selected queue managers are healthy.</p>
+        {% else %}
+        <h2>Queue Managers Needing Attention</h2>
+        <table class="data">
+          <tr>
+            <th>Queue Manager</th>
+            <th>Status</th>
+            <th>Certs</th>
+            <th>Next Expiry</th>
+            <th>Attention</th>
+          </tr>
+          {% for entry in monitor_attention_entries %}
+          {% set entry_status = entry.status | default('unknown') | string | lower | replace('_', '-') %}
+          <tr>
+            <td>
+              <strong>{{ entry.qmgr_name | default('unknown') | upper | e }}</strong>
+              <br><span class="muted">{{ entry.namespace | default('unknown') | e }} / {{ entry.backend | default('unknown') | e }}</span>
+            </td>
+            <td><span class="status-pill status-{{ entry_status }}">{{ entry.status | default('unknown') | e }}</span></td>
+            <td>{{ entry.cert_count | default('0') | e }}/{{ entry.expected_cert_count | default(entry.cert_count | default('0')) | e }}</td>
+            <td>
+              {{ entry.next_expiring_cert_name | default('not captured') | e }}
+              <br><span class="muted">
+                {{ nativeha_cert_expires({'not_after': entry.next_expiring_not_after | default('', true), 'days_remaining': entry.next_expiring_days | default('', true)}) }}
+              </span>
+            </td>
+            <td>
+              {% if entry.alerts | default([]) | length == 0 %}
+              None
+              {% else %}
+              {% for alert in entry.alerts %}
+              {% set alert_status = alert.alert_status | default('attention') | string | lower | replace('_', '-') %}
+              <span class="status-pill status-{{ alert_status }}">{{ alert.cert_type | e }} {{ alert.alert_status | e }}</span>
+              <br><span class="muted">{{ alert.detail | e }}</span>{% if not loop.last %}<br>{% endif %}
+              {% endfor %}
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </table>
+        {% endif %}
+        {% endif %}
+
+        <div class="footer">
+          This report is generated by MQ NativeHA automation. Certificate material
+          and passwords are not included in this email. Generated at {{ _nativeha_report_timestamp | e }}.
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
