@@ -1,0 +1,45 @@
+---
+# Purpose: Add a public client or signer certificate to one queue manager trust source.
+- name: "NativeHA Client/Signer Trust Certificate Add"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+    - ../../../nativeha_templates/global_vars/certs_control_vars.yaml
+
+  tasks:
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    - name: "Run client/signer trust add workflow"
+      block:
+        - name: "Client/signer trust add - Execute"
+          ansible.builtin.include_role:
+            name: cert_client_trust_add
+
+        - name: "Client/signer trust add - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        - name: "Client/signer trust add - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        - name: "Client/signer trust add - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Client/Signer Trust Add"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Add or update public client/signer certificates trusted by one MQ
+              NativeHA queue manager and publish the GitOps trust patch.
+
+        - name: "Client/signer trust add - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Client/signer trust add failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

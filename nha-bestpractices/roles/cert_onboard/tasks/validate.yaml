@@ -1,0 +1,120 @@
+---
+# Pre-flight checks for one resolved queue manager target.
+
+# Purpose: Normalize resolved identity values before validating them.
+- name: "Validate - Normalize resolved target identity"
+  ansible.builtin.set_fact:
+    _cert_validate_app_prefix: "{{ app_prefix | default('', true) | string | lower | trim }}"
+    _cert_validate_env_upper: "{{ env_upper | default('', true) | string | upper | trim }}"
+    _cert_validate_env_code: "{{ env_code | default('', true) | string | lower | trim }}"
+    _cert_validate_qmgr_name: "{{ qmgr_name | default('', true) | string | lower | trim }}"
+    _cert_validate_sequence_number: "{{ sequence_number | default('', true) | string | trim }}"
+    _cert_validate_expected_qmgr_pattern: >-
+      ^{{ app_prefix | default('', true) | string | lower | trim }}{{ env_code | default('', true) | string | lower | trim }}[0-9]{3}$
+    _cert_validate_expected_qmgr_example: >-
+      {{ app_prefix | default('', true) | string | lower | trim }}{{ env_code | default('', true) | string | lower | trim }}001
+
+# Purpose: Confirm target identity was derived before certificate onboarding starts.
+- name: "Validate - Resolved target"
+  ansible.builtin.assert:
+    that:
+      - app_sys_id is defined and _cert_validate_app_prefix is match('^[a-z0-9]{3}$')
+      - _cert_validate_env_upper in env_qmgr_abbr
+      - _cert_validate_env_upper in env_namespace_abbr
+      - _cert_validate_sequence_number is match('^[0-9]{3}$')
+      - _cert_validate_qmgr_name is match(_cert_validate_expected_qmgr_pattern)
+      - qmgr_name_upper is defined and qmgr_name_upper | length > 0
+      - namespace is defined and namespace | length > 0
+      - instance_type is defined and instance_type in instance_cert_map
+      - active_cert_types is defined and active_cert_types | length > 0
+      - cert_delivery_backend_effective in ['openshift_secret', 'vault']
+    fail_msg: >-
+      Resolved certificate target is incomplete. Check app_sys_id,
+      mq_environment, qmgr_name selector, and shared NativeHA global vars.
+      Received app={{ _cert_validate_app_prefix | upper | default('unknown', true) }},
+      environment={{ _cert_validate_env_upper | default('unknown', true) }},
+      qmgr={{ _cert_validate_qmgr_name | upper | default('unknown', true) }}.
+      Expected qmgr pattern: {{ _cert_validate_expected_qmgr_pattern }}
+      such as {{ _cert_validate_expected_qmgr_example | upper }}.
+    quiet: true
+
+# Purpose: Confirm certificate types and SAN settings are configured for this target.
+- name: "Validate - Certificate and SAN configuration"
+  ansible.builtin.assert:
+    that:
+      - cert_common_name is defined and cert_common_name | length > 0
+      - cert_country_name is defined and cert_country_name | length > 0
+      - cert_organization_name is defined and cert_organization_name | length > 0
+      - cert_key_size is defined and cert_key_size | int > 0
+      - cert_key_type is defined and cert_key_type in ['RSA', 'ECC']
+      - cluster_domains is defined and cluster_domains | length > 0
+      - cert_renewal_threshold_days is defined and cert_renewal_threshold_days | int > 0
+    fail_msg: >-
+      Certificate/SAN configuration is incomplete. Verify certs_control_vars.yaml
+      and openshift_clusters[{{ env_upper }}] cluster_domain values.
+    quiet: true
+
+# Purpose: Confirm client trust Secret names are valid Kubernetes names.
+- name: "Validate - Client trust naming"
+  ansible.builtin.assert:
+    that:
+      - (mq_client_trust_source_name | default('clientcerts')) is match('^[a-z0-9]+$')
+      - (mq_client_trust_secret_suffix | default('client-certs')) is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+      - (mq_client_trust_default_ca_item | default('company-ca.crt')) is match('^[A-Za-z0-9._-]+$')
+    fail_msg: >-
+      Client trust naming is invalid. The QueueManager pki.trust name must be
+      lowercase alphanumeric, the Secret suffix must be a DNS label, and the
+      default company CA item must be a simple Secret key filename.
+    quiet: true
+
+# Purpose: Confirm OpenShift backend targets are configured when that backend is selected.
+- name: "Validate - OpenShift backend configuration"
+  ansible.builtin.assert:
+    that:
+      - openshift_targets is defined
+      - openshift_targets | length > 0
+      - cert_openshift_secret_type is defined and cert_openshift_secret_type | length > 0
+    fail_msg: >-
+      OpenShift secret backend selected, but OpenShift target configuration is
+      incomplete for {{ env_upper }}/{{ qmgr_name }}.
+    quiet: true
+  when: cert_delivery_backend_effective == 'openshift_secret'
+
+# Purpose: Confirm Vault backend settings are configured when that backend is selected.
+- name: "Validate - Vault backend configuration"
+  ansible.builtin.assert:
+    that:
+      - vault_url is defined and vault_url | length > 0
+      - vault_cert_auth_method in ['token', 'approle']
+      - vault_cert_auth_method != 'token' or (vault_cert_token is defined and vault_cert_token | length > 0)
+      - vault_cert_auth_method != 'approle' or (vault_cert_role_id is defined and vault_cert_role_id | length > 0)
+      - vault_cert_auth_method != 'approle' or (vault_cert_secret_id is defined and vault_cert_secret_id | length > 0)
+      - vault_cert_mount_point is defined and vault_cert_mount_point | length > 0
+      - vault_cert_base_path is defined and vault_cert_base_path | length > 0
+      - _client_trust_vault_path_for_validation | length > 0
+      - _client_trust_vault_path_for_validation is not search('(^/|/$|//|\\.\\.)')
+    fail_msg: >-
+      Vault backend selected, but Vault auth/path settings are incomplete.
+      Use token auth with VAULT_TOKEN/vault_token, or AppRole auth with
+      VAULT_ROLE_ID and VAULT_SECRET_ID. The shared client trust Vault path
+      must be a relative KV path without duplicate or trailing slashes.
+    quiet: true
+  when: cert_delivery_backend_effective == 'vault'
+  vars:
+    _client_trust_vault_path_for_validation: >-
+      {{
+        vault_client_trust_shared_path
+        | default(mq_client_trust_vault_shared_path | default(app_prefix ~ '/ibm-mq/shared'))
+        | string
+        | trim
+      }}
+
+# Purpose: Stop certificate onboarding if any preflight validation failed.
+- name: "Validate - Pre-flight checks passed"
+  ansible.builtin.debug:
+    msg:
+      - "Queue Manager  : {{ qmgr_name | upper }}"
+      - "Namespace      : {{ namespace }}"
+      - "Cert Types     : {{ active_cert_types | join(', ') }}"
+      - "Backend        : {{ cert_delivery_backend_effective }}"
+      - "Renewal Window : {{ cert_renewal_threshold_days }} days"

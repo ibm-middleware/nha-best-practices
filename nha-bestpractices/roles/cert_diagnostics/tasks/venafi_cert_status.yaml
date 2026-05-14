@@ -1,0 +1,68 @@
+---
+# Purpose: Read certificate details needed for lifecycle decisions and reporting.
+- name: "Diagnostics - Query Venafi certificate {{ cert_type }}"
+  ansible.builtin.uri:
+    url: >-
+      {{ venafi_url }}{{ venafi_cert_search }}?ObjectDN={{
+        (venafi_policy_dn ~ '\\' ~ qmgr_name ~ '_' ~ cert_type_csr_suffix[cert_type])
+        | urlencode }}
+    method: GET
+    headers:
+      accept: "application/json"
+      Authorization: "Bearer {{ venafi_token }}"
+    validate_certs: "{{ venafi_validate_certs }}"
+    status_code: [200, 400, 404]
+  register: _venafi_status
+  failed_when: false
+  no_log: true
+
+# Purpose: Store live provider status for {{ cert_type }} diagnostics.
+- name: "Diagnostics - Venafi certificate status {{ cert_type }}"
+  ansible.builtin.debug:
+    msg:
+      - "Cert Type : {{ cert_type }}"
+      - "DN        : {{ venafi_policy_dn }}\\{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}"
+      - "HTTP      : {{ _venafi_status.status | default('unknown') }}"
+      - "Found     : {{ (_venafi_status.json.Certificates | default([]) | length) > 0 if _venafi_status.json is defined else false }}"
+
+# Purpose: Store Venafi status diagnostics for the final report.
+- name: "Diagnostics - Record Venafi certificate status {{ cert_type }}"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'mode_label': 'Venafi Certificate Status',
+            'qmgr_name': qmgr_name,
+            'namespace': namespace,
+            'target': qmgr_name | upper,
+            'check': 'Venafi status: ' ~ cert_type,
+            'status': (
+              'passed'
+              if (
+                _venafi_status.status | default(0) | int == 200
+                and _venafi_status.json is defined
+                and (_venafi_status.json.Certificates | default([]) | length) > 0
+              )
+              else 'attention'
+            ),
+            'detail': (
+              'DN: ' ~ venafi_policy_dn ~ '\\' ~ qmgr_name ~ '_' ~ cert_type_csr_suffix[cert_type]
+              ~ ' | HTTP ' ~ (_venafi_status.status | default('unknown') | string)
+              ~ ' | Certificate ' ~ (
+                ('found (' ~ (_venafi_status.json.Certificates | default([]) | length | string) ~ ' match)')
+                if (_venafi_status.json is defined and (_venafi_status.json.Certificates | default([]) | length) > 0)
+                else (
+                  'NOT FOUND — certificate may not have been requested or DN path is incorrect'
+                  if (_venafi_status.status | default(0) | int) == 200
+                  else (
+                    'endpoint returned error — check Venafi access and policy DN'
+                  )
+                )
+              )
+            )
+          }
+        ]
+      }}

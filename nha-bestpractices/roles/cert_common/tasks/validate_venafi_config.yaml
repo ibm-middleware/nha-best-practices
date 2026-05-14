@@ -1,0 +1,23 @@
+---
+# Validate Venafi settings immediately before a workflow needs Venafi.
+
+# Purpose: Stop early if Venafi connection settings are incomplete.
+- name: "Venafi - Validate connection settings"
+  ansible.builtin.assert:
+    that:
+      - venafi_url is defined and venafi_url | length > 0
+      - venafi_username is defined and venafi_username | length > 0
+      - venafi_password is defined and venafi_password | length > 0
+      - venafi_client_id is defined and venafi_client_id | length > 0
+      - venafi_scope is defined and venafi_scope | length > 0
+      - venafi_policy_dn is defined and venafi_policy_dn | length > 0
+      - venafi_oauth is defined and venafi_oauth | length > 0
+      - venafi_cert_request is defined and venafi_cert_request | length > 0
+      - venafi_cert_renew is defined and venafi_cert_renew | length > 0
+      - venafi_cert_retrieve is defined and venafi_cert_retrieve | length > 0
+      - venafi_token_revoke is defined and venafi_token_revoke | length > 0
+    fail_msg: >-
+      Venafi connection configuration is incomplete. Verify venafi_url,
+      Venafi username/password credential injection, client_id, scope, and
+      policy DN.
+    quiet: true

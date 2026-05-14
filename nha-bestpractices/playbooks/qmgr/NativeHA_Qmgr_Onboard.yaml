@@ -1,0 +1,43 @@
+---
+# Purpose: Create a new queue manager GitOps layout from the onboarding survey.
+- name: Onboard MQ Queue Manager
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  tasks:
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    - name: "Run queue manager onboard workflow"
+      block:
+        - name: "Queue manager onboard - Execute"
+          ansible.builtin.include_role:
+            name: qmgr_onboard
+
+        - name: "Queue manager onboard - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        - name: "Queue manager onboard - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        - name: "Queue manager onboard - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Queue Manager Onboard"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Create a new MQ NativeHA queue manager, generate GitOps base and
+              overlay content, and publish the change to the environment repo.
+
+        - name: "Queue manager onboard - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Queue manager onboard failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

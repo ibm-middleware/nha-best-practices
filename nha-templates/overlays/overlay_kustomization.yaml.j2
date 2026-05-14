@@ -1,0 +1,40 @@
+{#
+What it is:
+  Regional overlay Kustomization for a queue manager.
+Purpose:
+  Points each region at overlays/_shared and adds regional CRR topology/role
+  patches only for nhacrr queue managers.
+Variables coming from:
+  qmgr onboarding facts: current_region, instance_type, qmgr_name.
+  global_vars: regions.
+Produces:
+  overlays/<region>/kustomization.yaml.
+#}
+---
+# overlays/{{ current_region }}/kustomization.yaml - Regional overlay
+# This is the ArgoCD Application entry point for this region.
+# It references overlays/_shared and applies only region-specific patches.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../_shared
+patches:
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: {{ regions[current_region].region_label }}-patch-restart.yaml
+{#
+Section:
+  CRR overlays need immutable regional topology plus a small mutable role
+  patch. NHA and single-instance overlays consume only the shared layer.
+#}
+{% if instance_type == 'nhacrr' %}
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: {{ regions[current_region].region_label }}-patch-topology.yaml
+  - target:
+      kind: QueueManager
+      name: {{ qmgr_name }}
+    path: {{ regions[current_region].region_label }}-patch-role.yaml
+{% endif %}

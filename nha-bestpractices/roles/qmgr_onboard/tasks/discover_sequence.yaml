@@ -1,0 +1,165 @@
+---
+# Auto-discover next sequence number from Git repo
+# Scans target branch for existing <SYSID><ENV><SEQ> directories
+# and returns the next available 3-digit sequence.
+#
+# Input variables:
+#   app_prefix     - app id from survey, normalized earlier, for example dmq
+#   env_code       - two-character environment code, for example qp
+#   mq_environment - survey environment, used only when qmgr_root_rel is absent
+#   qmgr_root_rel  - queue manager root path, for example queue_managers/QA2
+#   git_work_dir   - cloned target repo path
+#
+# Remote branch rule:
+#   Open PR branches reserve sequence numbers even before merge.
+#   Branches must match feature/<app>/<qmgr>-... to be counted.
+#
+# Output variable:
+#   seq_number - next available 3-digit value, for example 004
+
+# Purpose: Choose queue manager root directory from inputs and defaults.
+- name: "Discover - Resolve QM root directory"
+  ansible.builtin.set_fact:
+    # qmgr_root_rel is normally set by workflow.yaml; default keeps this task reusable.
+    _qmgr_discovery_root_rel: >-
+      {{
+        qmgr_root_rel | default(
+          ('queue_managers/' ~ qmgr_env_subdir_map[mq_environment | upper])
+          if (mq_environment | upper) in (qmgr_env_subdir_map | default({}))
+          else 'queue_managers'
+        )
+      }}
+
+# Purpose: Check whether the generated queue manager path already exists.
+- name: "Discover - Ensure QM root directory exists"
+  # Allows a brand-new target repo to start at sequence 001 without find failing.
+  ansible.builtin.file:
+    path: "{{ git_work_dir }}/{{ _qmgr_discovery_root_rel }}"
+    state: directory
+    mode: "0755"
+
+# Purpose: Read existing queue manager files so only real targets are changed.
+- name: "Discover - List existing QM directories"
+  ansible.builtin.find:
+    paths: "{{ git_work_dir }}/{{ _qmgr_discovery_root_rel }}"
+    file_type: directory
+    recurse: false
+  register: _existing_qmgr_dirs
+  changed_when: false
+  check_mode: false
+
+# Purpose: Pull used sequence numbers from existing queue manager names.
+- name: "Discover - Parse sequence numbers"
+  ansible.builtin.set_fact:
+    # Prefix example: app_prefix=dmq and env_code=qp produces dmqqp.
+    _qmgr_discovery_app_prefix: "{{ app_prefix | lower }}"
+    _qmgr_discovery_prefix: "{{ app_prefix | lower }}{{ env_code | lower }}"
+    # Existing directory names under queue_managers/<ENV>.
+    _existing_qmgr_names: "{{ _existing_qmgr_dirs.files | default([]) | map(attribute='path') | map('basename') | map('lower') | list }}"
+
+# Purpose: Keep only sequence numbers for the requested app and environment.
+- name: "Discover - Extract matching sequence numbers"
+  ansible.builtin.set_fact:
+    _existing_git_seqs: >-
+      {{
+        _existing_qmgr_names
+        | select('match', '^' ~ _qmgr_discovery_prefix ~ '[0-9]{3}$')
+        | map('regex_replace', '^' ~ _qmgr_discovery_prefix, '')
+        | map('int')
+        | list
+      }}
+
+# Purpose: Read Git state so the workflow can enforce allowed-file rules.
+- name: "Discover - List remote automation branches"  # noqa command-instead-of-module
+  ansible.builtin.command:
+    argv:
+      - git
+      - ls-remote
+      - --heads
+      - origin
+  args:
+    chdir: "{{ git_work_dir }}"
+  register: _qmgr_remote_heads
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Purpose: Stop when remote branch lookup fails.
+- name: "Discover - Fail when remote branch lookup fails"
+  ansible.builtin.fail:
+    msg: |-
+      Queue manager sequence discovery could not check pending automation branches in the target Git repository.
+
+      Repository path: {{ git_work_dir }}
+      Detail: {{
+        _qmgr_remote_heads.stderr
+        | default(_qmgr_remote_heads.msg | default('git ls-remote did not return a reason.', true), true)
+        | string
+        | trim
+      }}
+
+      The run stopped before creating queue manager files or publishing changes.
+      Please verify the target repo URL, branch access, and Git credentials, then rerun.
+  when: _qmgr_remote_heads.rc | default(0) | int != 0
+
+# Purpose: Pull used sequence numbers from existing queue manager names.
+- name: "Discover - Parse pending automation branch sequence numbers"
+  ansible.builtin.set_fact:
+    # Pending branch names reserve sequence numbers for unmerged PRs.
+    _pending_qmgr_names: >-
+      {{
+        _qmgr_remote_heads.stdout_lines | default([])
+        | map('regex_replace', '^[0-9a-fA-F]+\s+refs/heads/', '')
+        | map('lower')
+        | select('match', '^feature/' ~ _qmgr_discovery_app_prefix ~ '/' ~ _qmgr_discovery_prefix ~ '[0-9]{3}-')
+        | map('regex_replace', '^feature/' ~ _qmgr_discovery_app_prefix ~ '/(' ~ _qmgr_discovery_prefix ~ '[0-9]{3})-.*$', '\1')
+        | list
+      }}
+
+# Purpose: Pull used sequence numbers from existing queue manager names.
+- name: "Discover - Parse pending automation branch sequence numbers"
+  ansible.builtin.set_fact:
+    _pending_branch_seqs: >-
+      {{
+        _pending_qmgr_names
+        | select('match', '^' ~ _qmgr_discovery_prefix ~ '[0-9]{3}$')
+        | map('regex_replace', '^' ~ _qmgr_discovery_prefix, '')
+        | map('int')
+        | list
+      }}
+
+# Purpose: Merge existing queue manager and open-PR sequences so the next number is unique.
+- name: "Discover - Combine deployed and pending sequence numbers"
+  ansible.builtin.set_fact:
+    # _existing_seqs includes both merged queue managers and open branch reservations.
+    _existing_seqs: "{{ ((_existing_git_seqs | default([])) + (_pending_branch_seqs | default([]))) | unique | list }}"
+
+# Purpose: Choose the next unused queue manager sequence number.
+- name: "Discover - Compute next sequence"
+  ansible.builtin.set_fact:
+    _qmgr_discovery_next_seq: >-
+      {{ '%03d' | format(((_existing_seqs | max | default(0)) | int) + 1) }}
+
+# Purpose: Stop when sequence range is exhausted.
+- name: "Discover - Fail if sequence range is exhausted"
+  ansible.builtin.fail:
+    msg: >-
+      No free queue manager sequence is available for
+      {{ _qmgr_discovery_prefix }}. Maximum configured sequence is
+      {{ qmgr_onboard_seq_max_scan | default(999) }}.
+  when: >-
+    (_qmgr_discovery_next_seq | int)
+    > (qmgr_onboard_seq_max_scan | default(999) | int)
+
+# Purpose: Save the selected sequence number for queue manager name generation.
+- name: "Discover - Store next sequence"
+  ansible.builtin.set_fact:
+    seq_number: "{{ _qmgr_discovery_next_seq }}"
+
+# Purpose: Print the selected queue manager sequence number.
+- name: "Discover - Result"
+  ansible.builtin.debug:
+    msg: >-
+      Auto-discovered sequence: {{ seq_number }} (found
+      {{ _existing_git_seqs | length }} merged and
+      {{ _pending_branch_seqs | length }} pending automation branch sequence(s))

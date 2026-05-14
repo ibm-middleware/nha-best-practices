@@ -1,0 +1,250 @@
+---
+# Pluggable diagnostics for individual certificate-management functions.
+
+# Purpose: Define human-readable descriptions for each diagnostic mode.
+- name: "Diagnostics - Define mode descriptions"
+  ansible.builtin.set_fact:
+    _diagnostic_mode_descriptions:
+      venafi_connectivity: >-
+        Test Venafi TPP authentication. Validates credentials, OAuth token grant,
+        and confirms the WebSDK endpoint is reachable.
+      venafi_cert_status: >-
+        Query Venafi for the live certificate status of each target queue manager.
+        Shows whether the certificate DN exists, HTTP response, and discovery state.
+      venafi_get_root_certs: >-
+        Download the full signer chain (root-first) from Venafi for each target.
+        Verifies the chain is retrievable and writes PEM files for inspection.
+      csr_generate: >-
+        Generate a Certificate Signing Request (CSR) for each target without
+        submitting it to Venafi. Validates key generation, CN, SANs, and extensions.
+      openshift_connectivity: >-
+        Validate OpenShift API access and namespace permissions for each target.
+        Confirms the token can get/create/update Secrets in the MQ namespace.
+      openshift_namespace_check: >-
+        Verify that the target namespace exists and the automation token has
+        the required RBAC permissions for Secret management.
+      openshift_secret_read: >-
+        Read the existing TLS Secrets from OpenShift for each target queue manager.
+        Confirms certificate material is present and accessible.
+      vault_connectivity: >-
+        Check HashiCorp Vault health endpoint. Confirms the Vault cluster is
+        reachable, unsealed, and responding to API requests.
+      vault_cert_read: >-
+        Read certificate data from the Vault KV engine for each target.
+        Verifies the KV path exists and contains tls.crt and tls.key.
+      registry_report: >-
+        Generate a certificate registry health report from the Git state branch.
+        Shows expiry status, missing certs, and backend consistency.
+
+# Purpose: Normalize diagnostics inputs and initialize report rows.
+- name: "Diagnostics - Normalize inputs"
+  ansible.builtin.set_fact:
+    diagnostic_mode_effective: "{{ diagnostic_mode | default('', true) | string | lower | trim }}"
+    nativeha_report_diagnostic_results: []
+
+# Purpose: Make sure diagnostics mode is one of the supported choices.
+- name: "Diagnostics - Validate mode"
+  ansible.builtin.assert:
+    that:
+      - diagnostic_mode_effective | default('', true) | length > 0
+      - diagnostic_mode_effective in _diagnostic_modes
+    fail_msg: >-
+      diagnostic_mode is required. Supported modes:
+      {{ _diagnostic_modes | join(', ') }}.
+    quiet: true
+  vars:
+    _diagnostic_modes:
+      - venafi_connectivity
+      - venafi_cert_status
+      - venafi_get_root_certs
+      - csr_generate
+      - openshift_connectivity
+      - openshift_namespace_check
+      - openshift_secret_read
+      - vault_connectivity
+      - vault_cert_read
+      - registry_report
+
+# Purpose: Display a prominent banner showing the diagnostic mode being tested.
+- name: "Diagnostics - Mode banner"
+  ansible.builtin.debug:
+    msg:
+      - "══════════════════════════════════════════════════════════════"
+      - "  DIAGNOSTIC MODE: {{ diagnostic_mode_effective | upper }}"
+      - "══════════════════════════════════════════════════════════════"
+      - ""
+      - "  {{ _diagnostic_mode_descriptions[diagnostic_mode_effective] | default('No description available.') | trim }}"
+      - ""
+      - "  Application:  {{ app_prefix | default(app_sys_id | default('not specified')) | upper }}"
+      - "  Environment:  {{ mq_environment | default('not specified') | upper }}"
+      - "  QM Scope:     {{ qmgr_name | default('not specified') }}"
+      - "══════════════════════════════════════════════════════════════"
+
+# Purpose: Check backend connectivity before running live certificate diagnostics.
+- name: "Diagnostics - Venafi connectivity"
+  when: diagnostic_mode_effective == 'venafi_connectivity'
+  block:
+    # Purpose: Stop early if Venafi connection settings are incomplete.
+    - name: "Diagnostics - Validate Venafi settings"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/validate_venafi_config.yaml"
+
+    # Purpose: Get a Venafi token before live certificate operations.
+    - name: "Diagnostics - Authenticate to Venafi"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/venafi_auth.yaml"
+
+    # Purpose: Check backend connectivity before running live certificate diagnostics.
+    - name: "Diagnostics - Venafi connectivity passed"
+      ansible.builtin.debug:
+        msg: "Venafi authentication succeeded for {{ venafi_url }}."
+
+    # Purpose: Store Venafi connectivity diagnostics for the final report.
+    - name: "Diagnostics - Record Venafi connectivity result"
+      ansible.builtin.set_fact:
+        nativeha_report_diagnostic_results: >-
+          {{
+            nativeha_report_diagnostic_results | default([])
+            + [
+              {
+                'mode': diagnostic_mode_effective,
+                'target': 'Venafi',
+                'check': 'authentication',
+                'status': 'passed',
+                'detail': 'Authenticated successfully to ' ~ venafi_url
+              }
+            ]
+          }}
+
+  always:
+    # Purpose: Revoke the certificate from the provider when configured.
+    - name: "Diagnostics - Revoke Venafi token"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/venafi_revoke_token.yaml"
+      when: venafi_token | default('', true) | length > 0
+
+# Purpose: Check backend connectivity before running live certificate diagnostics.
+- name: "Diagnostics - Vault connectivity"
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/health"
+    method: GET
+    validate_certs: "{{ vault_validate_certs | default(true) }}"
+    status_code: [200, 429, 472, 473, 501, 503]
+  register: _vault_health
+  when: diagnostic_mode_effective == 'vault_connectivity'
+
+# Purpose: Check backend connectivity before running live certificate diagnostics.
+- name: "Diagnostics - Vault connectivity result"
+  ansible.builtin.debug:
+    msg: "Vault health endpoint returned HTTP {{ _vault_health.status }} from {{ vault_url }}."
+  when: diagnostic_mode_effective == 'vault_connectivity'
+
+# Purpose: Store Vault connectivity diagnostics for the final report.
+- name: "Diagnostics - Record Vault connectivity result"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'mode_label': 'Vault Connectivity',
+            'target': 'Vault',
+            'check': 'health',
+            'status': (
+              'passed'
+              if (_vault_health.status | default(0) | int) in [200, 429, 472, 473]
+              else 'attention'
+            ),
+            'detail': (
+              'Health endpoint returned HTTP ' ~ (_vault_health.status | default('unknown') | string)
+              ~ ' from ' ~ vault_url ~ '. '
+              ~ (
+                'Vault is healthy and active.'
+                if (_vault_health.status | default(0) | int) == 200
+                else (
+                  'Vault is in standby mode (expected for HA replicas).'
+                  if (_vault_health.status | default(0) | int) == 429
+                  else (
+                    'Vault is in recovery mode.'
+                    if (_vault_health.status | default(0) | int) == 472
+                    else (
+                      'Vault is in performance standby.'
+                      if (_vault_health.status | default(0) | int) == 473
+                      else (
+                        'Vault is sealed or uninitialized — cannot serve requests.'
+                        if (_vault_health.status | default(0) | int) in [501, 503]
+                        else 'Unexpected status — check Vault logs.'
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          }
+        ]
+      }}
+  when: diagnostic_mode_effective == 'vault_connectivity'
+
+# Purpose: Prepare the certificate diagnostics result shown to the operator.
+- name: "Diagnostics - Registry report"
+  ansible.builtin.include_role:
+    name: cert_monitor
+  when: diagnostic_mode_effective == 'registry_report'
+
+# Purpose: Store registry diagnostics for the final report.
+- name: "Diagnostics - Record registry report result"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'target': (
+              (app_prefix | default(app_sys_id | default('unknown')) | upper)
+              ~ '/'
+              ~ (env_upper | default(mq_environment | default('unknown')) | upper)
+            ),
+            'check': 'registry report',
+            'status': (
+              'attention'
+              if (_monitor_alert_entries | default([]) | length > 0)
+              else 'passed'
+            ),
+            'detail': (
+              (_monitor_alert_entries | default([]) | length | string) ~ ' queue manager(s) need attention'
+              if (_monitor_alert_entries | default([]) | length > 0)
+              else ((_monitor_report | default([]) | length | string) ~ ' queue manager(s) reviewed')
+            )
+          }
+        ]
+      }}
+  when: diagnostic_mode_effective == 'registry_report'
+
+# Purpose: Turn the requested queue manager scope into an exact target list.
+- name: "Diagnostics - Resolve targets"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/resolve_targets.yaml"
+  when: diagnostic_mode_effective in [
+          'venafi_cert_status',
+          'venafi_get_root_certs',
+          'csr_generate',
+          'openshift_connectivity',
+          'openshift_namespace_check',
+          'openshift_secret_read',
+          'vault_cert_read'
+        ]
+
+# Purpose: Run this workflow once for each resolved queue manager target.
+- name: "Diagnostics - Process targets"
+  ansible.builtin.include_tasks: process_target.yaml
+  loop: "{{ cert_targets | default([]) }}"
+  loop_control:
+    loop_var: cert_target
+    label: "{{ cert_target.qmgr_name }}"
+  when: diagnostic_mode_effective in [
+          'venafi_cert_status',
+          'venafi_get_root_certs',
+          'csr_generate',
+          'openshift_connectivity',
+          'openshift_namespace_check',
+          'openshift_secret_read',
+          'vault_cert_read'
+        ]

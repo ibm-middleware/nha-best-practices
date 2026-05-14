@@ -1,0 +1,22 @@
+{#
+What it is:
+  Regional JSON 6902 patch for an intentional QueueManager restart.
+Purpose:
+  Changes spec.annotations, which the MQ Operator exposes as pass-through pod
+  annotations, so the operator reconciles through its managed rollout path.
+Variables coming from:
+  qmgr onboarding or qmgr_restart role: qmgr_restart_at, qmgr_restart_reason,
+  qmgr_restart_requested_by.
+Produces:
+  overlays/<region>/<region_label>-patch-restart.yaml.
+#}
+---
+- op: add
+  path: /spec/annotations/{{ restart_annotation_json_pointer_prefix }}~1restart-at
+  value: "{{ qmgr_restart_at | default('initial') }}"
+- op: add
+  path: /spec/annotations/{{ restart_annotation_json_pointer_prefix }}~1restart-reason
+  value: "{{ qmgr_restart_reason | default('onboarded') }}"
+- op: add
+  path: /spec/annotations/{{ restart_annotation_json_pointer_prefix }}~1restart-requested-by
+  value: "{{ qmgr_restart_requested_by | default('ansible-automation') }}"

@@ -1,0 +1,63 @@
+---
+# Purpose: Collect certificate details for the requested queue manager scope.
+- name: "NativeHA Certificate Diagnostics"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+    - ../../../nativeha_templates/global_vars/certs_control_vars.yaml
+
+  tasks:
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    - name: "Run certificate diagnostics workflow"
+      block:
+        - name: "Certificate diagnostics - Execute"
+          ansible.builtin.include_role:
+            name: cert_diagnostics
+
+        - name: "Certificate diagnostics - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        - name: "Certificate diagnostics - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+        - name: "Certificate diagnostics - Record failed diagnostic summary"
+          ansible.builtin.set_fact:
+            nativeha_report_diagnostic_results: >-
+              {{
+                nativeha_report_diagnostic_results | default([])
+                + [
+                  {
+                    'mode': diagnostic_mode | default('unknown', true) | string | lower | trim,
+                    'target': qmgr_name | default(app_sys_id | default('diagnostics', true), true) | upper,
+                    'check': nativeha_failed_task_name | default('diagnostic task'),
+                    'status': 'failed',
+                    'detail': nativeha_playbook_error | default('Diagnostic task failed.')
+                  }
+                ]
+              }}
+
+      always:
+        - name: "Certificate diagnostics - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: >-
+              Certificate Diagnostics — {{ diagnostic_mode | default('unknown') }}
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Diagnostic mode: {{ diagnostic_mode | default('unknown') }}.
+              {{ _diagnostic_mode_descriptions[diagnostic_mode | default('unknown') | lower | trim]
+                 | default('Run focused certificate diagnostics.') }}
+
+        - name: "Certificate diagnostics - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Certificate diagnostics failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

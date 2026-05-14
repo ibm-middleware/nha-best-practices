@@ -1,0 +1,24 @@
+---
+# Collection Requirements - MQ NativeHA Management (AAP)
+# AAP Project sync looks for collections/requirements.yml when
+# the SCM project points at NativeHA_MQ_Management/.
+#
+# Manual install:
+#   ansible-galaxy collection install -r collections/requirements.yml
+
+collections:
+  - name: community.general
+    version: "9.5.13"
+    source: https://galaxy.ansible.com
+
+  - name: community.crypto
+    version: "2.26.7"
+    source: https://galaxy.ansible.com
+
+  - name: community.hashi_vault
+    version: "4.2.0"
+    source: https://galaxy.ansible.com
+
+  - name: kubernetes.core
+    version: "3.3.1"
+    source: https://galaxy.ansible.com

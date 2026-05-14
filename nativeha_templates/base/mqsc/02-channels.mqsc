@@ -1,4 +1,0 @@
-* MQ Channel Definitions
-
-* Prometheus monitoring (no TLS - internal cluster-only channel)
-DEFINE CHANNEL('MONITOR.SVRCONN') CHLTYPE(SVRCONN) TRPTYPE(TCP) MCAUSER('mqmon') MAXMSGL(4194304) REPLACE

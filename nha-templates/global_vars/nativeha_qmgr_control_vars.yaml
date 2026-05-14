@@ -1,0 +1,400 @@
+---
+# MQ NativeHA - Queue Manager Control Variables
+# Edit values here. AAP survey provides ONLY dynamic inputs.
+# Secrets (passwords, tokens) are injected via AAP credentials at runtime.
+
+# ═══════════════════════════════════════════════════════════════════
+# GitOps Publish Mode
+# ═══════════════════════════════════════════════════════════════════
+
+# direct = commit to branch; pull_request = create PR via Bitbucket API
+target_repo_change_mode: "direct"
+
+# ═══════════════════════════════════════════════════════════════════
+# MQ Operator Version & Licensing
+# ═══════════════════════════════════════════════════════════════════
+
+mq_versions:
+  NONPROD: "9.4.3.1-r1"
+  PROD: "9.4.5.0-r1"
+
+license_ids:
+  NONPROD: "L-XXXX-XXXXXX"
+  PROD: "L-YYYY-YYYYYY"
+
+# ═══════════════════════════════════════════════════════════════════
+# Node Scheduling
+# ═══════════════════════════════════════════════════════════════════
+
+# Taint/toleration for MQ pods: mqha=true:NoSchedule
+node_selector_key: "mqha"
+node_selector_value: "true"
+
+# ═══════════════════════════════════════════════════════════════════
+# Git Configuration
+# ═══════════════════════════════════════════════════════════════════
+
+# Per-environment target repository URLs
+env_repo_map:
+  DEV: "git@bitbucket.example.com:MQPROJECT/mq-nativeha-dev.git"
+  QA1: "git@bitbucket.example.com:MQPROJECT/mq-nativeha-qa.git"
+  QA2: "git@bitbucket.example.com:MQPROJECT/mq-nativeha-qa.git"
+  QA3: "git@bitbucket.example.com:MQPROJECT/mq-nativeha-qa3.git"
+  PROD: "git@bitbucket.example.com:MQPROJECT/mq-nativeha-prod.git"
+
+# QA1/QA2 share one repo — subdir separates them
+qmgr_env_subdir_map:
+  QA1: "QA1"
+  QA2: "QA2"
+
+# Target branch per environment
+env_branch_map:
+  DEV: "develop"
+  QA1: "develop"
+  QA2: "develop"
+  QA3: "develop"
+  PROD: "develop"
+
+# Git commit identity
+git_user_name: "MQ Automation"
+git_user_email: "mq-automation@example.com"
+
+# Git SSH policy
+git_accept_hostkey: true
+git_ssh_command: "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+git_ssh_options: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+# Temp working directory for git clone operations
+git_work_dir: "/tmp/mqnativeha_automation"
+
+# ═══════════════════════════════════════════════════════════════════
+# Bitbucket Pull Request (used when target_repo_change_mode=pull_request)
+# ═══════════════════════════════════════════════════════════════════
+
+# LAB: Bitbucket Cloud
+# (Requires setup/pr_backends/target_repo_pr_cloud.yaml to be active)
+bitbucket_cloud_api_url: "https://api.bitbucket.example.com/2.0"
+bitbucket_validate_certs: true
+
+# COMPANY: Bitbucket On-Premise (Server / Data Center)
+# Swap PR backend first:
+#   cp setup/pr_backends/target_repo_pr_onprem.yaml NativeHA_MQ_Management/roles/gitops_publish/tasks/target_repo_pr.yaml
+# Then uncomment and set:
+# bitbucket_internal_api_url: "https://bitbucket.example.com/rest/api/latest"
+
+# ═══════════════════════════════════════════════════════════════════
+# Environment Abbreviation Maps (naming identity)
+# ═══════════════════════════════════════════════════════════════════
+
+# Namespace: <SYSID>-MQ-<3-CHAR-ENV>-<SEQ>
+env_namespace_abbr:
+  DEV: "DEV"
+  QA1: "QA1"
+  QA2: "QA2"
+  QA3: "QA3"
+  PROD: "PRD"
+
+# Queue manager: <SYSID><2-CHAR-ENV><SEQ>
+env_qmgr_abbr:
+  DEV: "DV"
+  QA1: "Q1"
+  QA2: "Q2"
+  QA3: "Q3"
+  PROD: "PR"
+
+# Instance type per environment
+env_instance_type_map:
+  DEV: "nha"
+  QA1: "nha"
+  QA2: "nhacrr"
+  QA3: "nha"
+  PROD: "nhacrr"
+
+# Maps instance_type to QueueManager CR template
+instance_type_to_template:
+  single: "sgl_qmgr.yaml.j2"
+  nha: "nha_qmgr.yaml.j2"
+  nhacrr: "crr_qmgr.yaml.j2"
+
+# ═══════════════════════════════════════════════════════════════════
+# Regions & OpenShift Clusters
+# ═══════════════════════════════════════════════════════════════════
+
+regions:
+  use:
+    region_label: "east"
+  usw:
+    region_label: "west"
+
+env_region_map:
+  DEV:
+    - "cluster1"
+  QA1:
+    - "cluster1"
+  QA2:
+    - "cluster1"
+    - "cluster2"
+  QA3:
+    - "cluster1"
+  PROD:
+    - "cluster1"
+    - "cluster2"
+
+# API tokens injected via AAP credentials at runtime (token_env names)
+openshift_clusters:
+  DEV:
+    cluster1:
+      api_url: "https://api.ocp-cluster1.example.com:6443"
+      cluster_domain: "apps.ocp-cluster1.example.com"
+      token_env: "MQ_OCP_DEV_CLUSTER1_TOKEN"
+      validate_certs: false
+  QA1:
+    cluster1:
+      api_url: "https://api.ocp-cluster1.example.com:6443"
+      cluster_domain: "apps.ocp-cluster1.example.com"
+      token_env: "MQ_OCP_QA1_CLUSTER1_TOKEN"
+      validate_certs: false
+  QA2:
+    cluster1:
+      api_url: "https://api.ocp-cluster1.example.com:6443"
+      cluster_domain: "apps.ocp-cluster1.example.com"
+      token_env: "MQ_OCP_QA2_CLUSTER1_TOKEN"
+      validate_certs: false
+    cluster2:
+      api_url: "https://api.ocp-cluster1.example.com:6443"
+      cluster_domain: "apps.ocp-cluster1.example.com"
+      token_env: "MQ_OCP_QA2_CLUSTER2_TOKEN"
+      validate_certs: false
+  QA3:
+    cluster1:
+      api_url: "https://api.ocp-cluster1.example.com:6443"
+      cluster_domain: "apps.ocp-cluster1.example.com"
+      token_env: "MQ_OCP_QA3_CLUSTER1_TOKEN"
+      validate_certs: false
+  PROD:
+    cluster1:
+      api_url: "https://api.ocp-cluster1.example.com:6443"
+      cluster_domain: "apps.ocp-cluster1.example.com"
+      token_env: "MQ_OCP_PROD_CLUSTER1_TOKEN"
+      validate_certs: false
+    cluster2:
+      api_url: "https://api.ocp-cluster1.example.com:6443"
+      cluster_domain: "apps.ocp-cluster1.example.com"
+      token_env: "MQ_OCP_PROD_CLUSTER2_TOKEN"
+      validate_certs: false
+
+# ═══════════════════════════════════════════════════════════════════
+# MQ Container Image
+# ═══════════════════════════════════════════════════════════════════
+
+# Internal registry (lab). Change to icr.io / ibm-messaging/mq for public.
+mq_image_registry: "registry.example.com"
+mq_image_repository: "ibm-mq/mq"
+
+# ═══════════════════════════════════════════════════════════════════
+# Certificate Delivery Backend
+# ═══════════════════════════════════════════════════════════════════
+
+# openshift_secret | vault
+mq_cert_delivery_backend: "openshift_secret"
+
+# VSO sync — only enable with mq_cert_delivery_backend=vault
+enable_vso_secret_sync: false
+
+# ═══════════════════════════════════════════════════════════════════
+# Restart Annotation
+# ═══════════════════════════════════════════════════════════════════
+
+restart_annotation_prefix: "nativeha.example.com"
+restart_annotation_json_pointer_prefix: "{{ restart_annotation_prefix | replace('~', '~0') | replace('/', '~1') }}"
+
+# ═══════════════════════════════════════════════════════════════════
+# MQ Client/Signer Trust Store
+# ═══════════════════════════════════════════════════════════════════
+
+mq_client_trust_source_name: "clientcerts"
+mq_client_trust_secret_suffix: "client-certs"
+mq_client_trust_default_ca_item: "company-ca.crt"
+mq_client_trust_vault_shared_path: "{{ (app_prefix | default(app_sys_id | default('')) | lower) ~ '/ibm-mq/shared' }}"
+
+# ═══════════════════════════════════════════════════════════════════
+# Custom External MQ Client Route
+# ═══════════════════════════════════════════════════════════════════
+
+custom_client_route_enabled: true
+custom_client_dns_domain: "example.com"
+custom_client_route_name_suffix: "custom-dns-cname"
+custom_client_route_target_port: 1414
+custom_client_route_include_san: true
+
+# ═══════════════════════════════════════════════════════════════════
+# Email Notifications
+# ═══════════════════════════════════════════════════════════════════
+
+notification_email_enabled: true
+notification_email_send_success: true
+notification_email_send_failure: true
+notification_email_subject_prefix: "[MQ NativeHA]"
+notification_email_timeout: 20
+notification_email_no_log: true
+notification_email_host: "smtp.example.com"
+notification_email_port: 587
+notification_email_secure: "starttls"
+notification_email_from: "mq-automation@example.com"
+notification_email_username: "mq-automation@example.com"
+notification_email_password: "{{ lookup('ansible.builtin.env', 'NATIVEHA_SMTP_PASSWORD', default='') }}"  # pragma: allowlist secret
+notification_email_to:
+  - "admin@example.com"
+
+# COMPANY: internal relay, no auth
+# notification_email_host: "smtp-relay.example.com"
+# notification_email_port: 25
+# notification_email_secure: "none"
+# notification_email_from: "mq-automation@example.com"
+# notification_email_username: ""
+# notification_email_password: ""
+
+# ═══════════════════════════════════════════════════════════════════
+# Vault Secrets Operator (VSO)
+# ═══════════════════════════════════════════════════════════════════
+
+# Safe default for _zone outside onboarding context
+_zone: >-
+  {{
+    _zone | default(
+      'hra' if (app_prefix | default('unknown')) in (vault_security_zones.hra.apps | default([]))
+      else 'sra'
+    )
+  }}
+
+vault_url: "https://vault.example.com:8200"
+
+vso_vault_connection_name: "{{ app_prefix }}-vault-connection"
+vso_vault_auth_name: "{{ app_prefix }}-vault-auth"
+vso_vault_role: "{{ vault_security_zones[_zone].vso_role }}"
+vso_service_account: "{{ vault_security_zones[_zone].vso_sa }}"
+vso_kubernetes_auth_mount: "{{ vault_security_zones[_zone].auth_mount | default('kubernetes') }}"
+vso_vault_skip_tls: false
+vso_vault_ca_secret: "vault-ca-cert"
+vso_refresh_after: "60s"
+
+# Security zones — if app_sys_id is in hra.apps, use hra; else sra
+vault_security_zones:
+  hra:
+    mount: "hra/kv"
+    label: ""
+    auth_mount: "kubernetes"
+    vso_role: "{{ app_prefix }}-hra-vso-role"
+    vso_sa: "{{ app_prefix }}-hra-vso-sa"
+    apps: ["dmq", "amq", "mqp"]
+  sra:
+    mount: "sra/kv"
+    label: ""
+    auth_mount: "kubernetes"
+    vso_role: "{{ app_prefix }}-sra-vso-role"
+    vso_sa: "{{ app_prefix }}-sra-vso-sa"
+
+# ═══════════════════════════════════════════════════════════════════
+# Sizing Matrix
+# ═══════════════════════════════════════════════════════════════════
+# prettier-ignore
+#        ENV.TIER     req_cpu  lim_cpu  req_mem  lim_mem  qmgr_stor  log_stor  log_pages  storage_class
+
+sizing_order: [small, medium, large, xlarge]
+
+sizing:
+  DEV:
+    small:  {request_cpu: "250m", limits_cpu: "500m", request_memory: "512Mi", limits_memory: "1Gi",  qmgr_storage: "2Gi",  log_storage: "2Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+    medium: {request_cpu: "500m", limits_cpu: "1",    request_memory: "1Gi",   limits_memory: "2Gi",  qmgr_storage: "3Gi",  log_storage: "3Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+  QA1:
+    small:  {request_cpu: "250m", limits_cpu: "500m", request_memory: "512Mi", limits_memory: "1Gi",  qmgr_storage: "2Gi",  log_storage: "2Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+    medium: {request_cpu: "500m", limits_cpu: "1",    request_memory: "1Gi",   limits_memory: "2Gi",  qmgr_storage: "3Gi",  log_storage: "3Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+  QA2:
+    small:  {request_cpu: "300m", limits_cpu: "500m", request_memory: "512Mi", limits_memory: "1Gi",  qmgr_storage: "2Gi",  log_storage: "2Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+    medium: {request_cpu: "500m", limits_cpu: "1",    request_memory: "1Gi",   limits_memory: "2Gi",  qmgr_storage: "4Gi",  log_storage: "4Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+    large:  {request_cpu: "1",    limits_cpu: "2",    request_memory: "2Gi",   limits_memory: "4Gi",  qmgr_storage: "6Gi",  log_storage: "6Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+    xlarge: {request_cpu: "2",    limits_cpu: "4",    request_memory: "4Gi",   limits_memory: "8Gi",  qmgr_storage: "7Gi",  log_storage: "7Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+  QA3:
+    small:  {request_cpu: "300m", limits_cpu: "500m", request_memory: "512Mi", limits_memory: "1Gi",  qmgr_storage: "1Gi",  log_storage: "1Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+    medium: {request_cpu: "500m", limits_cpu: "1",    request_memory: "1Gi",   limits_memory: "2Gi",  qmgr_storage: "5Gi",  log_storage: "5Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+    large:  {request_cpu: "1",    limits_cpu: "2",    request_memory: "2Gi",   limits_memory: "4Gi",  qmgr_storage: "10Gi", log_storage: "20Gi",  log_file_pages: 32768, storage_class: "lvms-vg1"}
+    xlarge: {request_cpu: "2",    limits_cpu: "4",    request_memory: "4Gi",   limits_memory: "8Gi",  qmgr_storage: "20Gi", log_storage: "40Gi",  log_file_pages: 65536, storage_class: "lvms-vg1"}
+  PROD:
+    small:  {request_cpu: "500m", limits_cpu: "1",    request_memory: "1Gi",   limits_memory: "2Gi",  qmgr_storage: "5Gi",  log_storage: "5Gi",   log_file_pages: 32768, storage_class: "lvms-vg1"}
+    medium: {request_cpu: "1",    limits_cpu: "2",    request_memory: "2Gi",   limits_memory: "4Gi",  qmgr_storage: "10Gi", log_storage: "20Gi",  log_file_pages: 32768, storage_class: "lvms-vg1"}
+    large:  {request_cpu: "2",    limits_cpu: "4",    request_memory: "4Gi",   limits_memory: "8Gi",  qmgr_storage: "20Gi", log_storage: "40Gi",  log_file_pages: 65536, storage_class: "lvms-vg1"}
+    xlarge: {request_cpu: "4",    limits_cpu: "8",    request_memory: "8Gi",   limits_memory: "16Gi", qmgr_storage: "50Gi", log_storage: "100Gi", log_file_pages: 65536, storage_class: "lvms-vg1"}
+
+# ═══════════════════════════════════════════════════════════════════
+# App MQSC Layout (onboard creates empty placeholder ConfigMaps)
+# ═══════════════════════════════════════════════════════════════════
+
+app_mqsc_mount_in_pod: true
+app_mqsc_group_dirs:
+  - "50-app-chlauth"
+  - "52-app-channel"
+  - "54-app-objects"
+  - "56-app-authrec"
+
+# ═══════════════════════════════════════════════════════════════════
+# MQ Web Console & Metrics
+# ═══════════════════════════════════════════════════════════════════
+
+web_enabled: false
+web_authentication: "manual"
+web_authorization: "manual"
+web_configmap: "webconsole-config"
+
+enable_metrics: true
+enable_webui: false
+enable_prometheus_monitor: false
+
+# Prometheus exporter settings
+prometheus_exporter_image: "registry.example.com/mq-tools/mq-metric-prometheus:5.7.1"
+prometheus_monitor_channel: "MONITOR.SVRCONN"
+prometheus_mq_port: 1414
+prometheus_metrics_port: 9157
+prometheus_poll_interval: "30s"
+prometheus_rediscover_interval: "1h"
+prometheus_log_level: "INFO"
+prometheus_keep_running: true
+prometheus_resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+prometheus_monitored_queues:
+  - "*"
+  - "!SYSTEM.*"
+  - "!AMQ.*"
+prometheus_monitored_channels:
+  - "*"
+prometheus_monitored_topics:
+  - "!*"
+prometheus_monitored_subscriptions:
+  - "!$SYS*"
+prometheus_show_inactive_channels: true
+prometheus_queue_subscription_selector:
+  - PUT
+  - GET
+  - GENERAL
+
+# ═══════════════════════════════════════════════════════════════════
+# CRR Configuration
+# ═══════════════════════════════════════════════════════════════════
+
+crr_cipher: "ANY_TLS12_OR_HIGHER"
+crr_replication_port: 443
+
+# ═══════════════════════════════════════════════════════════════════
+# Storage & ArgoCD
+# ═══════════════════════════════════════════════════════════════════
+
+allow_volume_expansion: true
+argocd_namespace: "openshift-gitops"
+argocd_project: "default"
+
+# Utility scripts ConfigMap toggle
+enable_scripts_configmap: true

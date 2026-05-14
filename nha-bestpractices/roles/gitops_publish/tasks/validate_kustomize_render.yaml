@@ -1,0 +1,97 @@
+---
+# validate_kustomize_render.yaml - Shared Kustomize Overlay Validation
+#
+# PURPOSE:
+#   Renders selected regional overlay paths using kubectl kustomize or
+#   kustomize build (fallback) and fails if neither renderer succeeds.
+#   Eliminates ~40 lines of duplicated validation logic per Day-2 role.
+#
+# USED BY:
+#   - qmgr_image_upgrade
+#   - qmgr_sizing_update
+#   - qmgr_app_objects_deploy
+#   - qmgr_restart
+#   - qmgr_role_switch
+#   - cert_client_trust_add
+#
+# REQUIRED VARIABLES FROM CALLER:
+#   _kustomize_overlay_paths - list of overlay directory paths to render
+#                              (absolute or relative to git_work_dir)
+#
+# OUTPUT:
+#   _render_results - the selected render result set (from kubectl or kustomize)
+#
+
+# Purpose: Render selected regional overlays using kubectl kustomize.
+- name: "Validation - Render selected regional overlays with kubectl"
+  ansible.builtin.command:  # noqa command-instead-of-module
+    argv:
+      - kubectl
+      - kustomize
+      - "--load-restrictor=LoadRestrictionsNone"
+      - "{{ item }}"
+  loop: "{{ _kustomize_overlay_paths }}"
+  register: _render_results_kubectl
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Purpose: Fall back to standalone kustomize binary when kubectl fails.
+- name: "Validation - Render selected regional overlays with kustomize fallback"
+  ansible.builtin.command:  # noqa command-instead-of-module
+    argv:
+      - kustomize
+      - build
+      - "--load-restrictor=LoadRestrictionsNone"
+      - "{{ item }}"
+  loop: "{{ _kustomize_overlay_paths }}"
+  register: _render_results_kustomize
+  changed_when: false
+  failed_when: false
+  when: >-
+    _render_results_kubectl.results
+    | selectattr('rc', 'ne', 0)
+    | list
+    | length > 0
+  check_mode: false
+
+# Purpose: Prefer the successful overlay render result from kubectl or kustomize.
+- name: "Validation - Select renderer results"
+  ansible.builtin.set_fact:
+    _render_results: >-
+      {{
+        _render_results_kubectl
+        if (
+          _render_results_kubectl.results
+          | selectattr('rc', 'ne', 0)
+          | list
+          | length == 0
+        )
+        else _render_results_kustomize
+      }}
+
+# Purpose: Stop if neither kubectl nor kustomize can render the selected overlays.
+- name: "Validation - Fail when selected overlays cannot be rendered"
+  ansible.builtin.assert:
+    that:
+      - _render_results.results | selectattr('rc', 'ne', 0) | list | length == 0
+    fail_msg: |-
+      Could not render selected regional overlays with kubectl kustomize or
+      kustomize build. Install one renderer on the AAP execution node.
+      Failed overlay(s):
+      {% for result in _render_results.results | default([]) %}
+      {% if result.rc | default(1) | int != 0 %}
+      {% set render_detail = (
+        result.stderr
+        | default(
+            result.stdout
+            | default(result.msg | default('No renderer detail was returned.', true), true),
+            true
+          )
+        | string
+        | regex_replace('\n+', ' ')
+        | trim
+      ) %}
+      - {{ result.item | default('unknown overlay') }}: {{ render_detail }}
+      {% endif %}
+      {% endfor %}

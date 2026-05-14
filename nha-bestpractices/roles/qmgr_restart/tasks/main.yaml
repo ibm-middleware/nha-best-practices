@@ -1,0 +1,351 @@
+---
+# Queue manager restart role
+#
+# Important behavior:
+# - This role is Git-only. It does not query OpenShift and does not delete pods.
+# - It changes only overlays/<region>/<region_label>-patch-restart.yaml.
+# - The restart is caused by changing spec.annotations in the QueueManager CR.
+#   The IBM MQ Operator passes these through as pod annotations and reconciles
+#   the managed rollout.
+
+# Purpose: Group the work so failures are reported and the temporary Git workspace is removed.
+- name: "Queue manager restart - Execute with guaranteed workspace cleanup"
+  block:
+    # Purpose: Check operator inputs before starting restart changes.
+    - name: "Pre-flight - Validate restart inputs"
+      ansible.builtin.assert:
+        that:
+          - mq_environment | default('', true) | trim | length > 0
+          - qmgr_name | default('', true) | trim | length > 0
+        fail_msg: "Required inputs: mq_environment and qmgr_name."
+
+    # Purpose: Trim and standardize operator input before validation.
+    - name: "Identity - Normalize input values"
+      ansible.builtin.set_fact:
+        env_upper: "{{ mq_environment | upper | trim }}"
+        qmgr_name_normalized: "{{ qmgr_name | lower | trim }}"
+        restart_region_raw: "{{ restart_region | default(restart_regions | default('all'), true) | lower | trim }}"
+
+    # Purpose: Stop early if the selected environment is missing required control-map entries.
+    - name: "Pre-flight - Validate environment is configured"
+      ansible.builtin.assert:
+        that:
+          - env_upper in env_qmgr_abbr
+          - env_upper in env_repo_map
+          - env_upper in env_branch_map
+          - env_upper in env_region_map
+        fail_msg: >-
+          mq_environment={{ env_upper }} is not configured in
+          nativeha_qmgr_control_vars.yaml.
+
+    # Purpose: Stop early if the region map cannot support the requested queue manager mode.
+    - name: "Pre-flight - Validate restart region catalog"
+      ansible.builtin.assert:
+        that:
+          - env_region_map[env_upper] | difference(regions.keys() | list) | length == 0
+        fail_msg: >-
+          Restart cannot continue because env_region_map[{{ env_upper }}]
+          references region keys that are missing from the regions catalog:
+          {{ env_region_map[env_upper] | difference(regions.keys() | list) }}.
+          Fix nativeha_qmgr_control_vars.yaml before rerunning.
+        quiet: true
+
+    # Purpose: Stop early if the queue manager name does not match the selected environment.
+    - name: "Pre-flight - Validate qmgr_name belongs to selected environment"
+      ansible.builtin.assert:
+        that:
+          - qmgr_name_normalized is match('^[a-z0-9]{3}' ~ (env_qmgr_abbr[env_upper] | lower) ~ '[0-9]{3}$')
+        fail_msg: >-
+          qmgr_name={{ qmgr_name }} does not belong to mq_environment={{ env_upper }}.
+          Expected pattern: <3-char-app>{{ env_qmgr_abbr[env_upper] | lower }}<3-digit-seq>.
+
+    # Purpose: Derive the GitOps repository path for the selected queue manager.
+    - name: "Identity - Derive target repo and selected regions"
+      ansible.builtin.set_fact:
+        git_repo_url: "{{ env_repo_map[env_upper] }}"
+        target_branch: "{{ env_branch_map[env_upper] }}"
+        qmgr_rel_path: >-
+          {{
+            ('queue_managers/' ~ qmgr_env_subdir_map[env_upper])
+            if env_upper in (qmgr_env_subdir_map | default({}))
+            else 'queue_managers'
+          }}/{{ qmgr_name_normalized }}
+        _restart_target_regions: >-
+          {{
+            env_region_map[env_upper]
+            if restart_region_raw in ['', 'all']
+            else (restart_region_raw.split(',')
+                  | map('trim')
+                  | reject('equalto', '')
+                  | unique
+                  | list)
+          }}
+
+    # Purpose: Validate the restart region selector against the queue manager regions.
+    - name: "Pre-flight - Validate restart regions"
+      ansible.builtin.assert:
+        that:
+          - _restart_target_regions | length > 0
+          - _restart_target_regions | difference(env_region_map[env_upper]) | length == 0
+        fail_msg: >-
+          restart_region={{ restart_region_raw }} is not valid for {{ env_upper }}.
+          Use all or one of: {{ env_region_map[env_upper] }}.
+
+    # Purpose: Build the exact patch file paths this run is allowed to edit.
+    - name: "Identity - Compute expected restart patch paths"
+      ansible.builtin.set_fact:
+        _expected_restart_patch_paths: >-
+          {% set paths = [] -%}
+          {% for rname in _restart_target_regions -%}
+          {{ paths.append(qmgr_rel_path ~ '/overlays/' ~ rname ~ '/' ~ regions[rname].region_label ~ '-patch-restart.yaml') or '' }}
+          {%- endfor -%}
+          {{ paths }}
+
+    # Purpose: Use a run-specific checkout so parallel jobs do not share files.
+    - name: "Git - Isolate working directory for this run"
+      ansible.builtin.set_fact:
+        git_work_dir_base: "{{ git_work_dir }}"
+        git_work_dir: "{{ git_work_dir }}/qmgr_restart_{{ qmgr_name_normalized }}_{{ now(utc=false, fmt='%Y%m%d%H%M%S') }}_{{ 1000000 | random }}"
+
+    # Purpose: Create the parent directory for temporary Git checkouts.
+    - name: "Git - Ensure work base exists"
+      ansible.builtin.file:
+        path: "{{ git_work_dir_base }}"
+        state: directory
+        mode: "0755"
+      check_mode: false
+
+    # Purpose: Clone the target repository and set the automation Git identity.
+    - name: "Git - Clone and configure target repo"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: git_clone_and_configure
+
+    # Purpose: Serialize direct-mode GitOps changes before reading and rendering patch files.
+    - name: "Git - Acquire direct publish lock"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: direct_publish_lock_acquire
+      vars:
+        direct_publish_lock_sync_after_acquire: true
+
+    # Purpose: Confirm expected restart patch files.
+    - name: "Pre-flight - Check expected restart patch files"
+      ansible.builtin.stat:
+        path: "{{ git_work_dir }}/{{ item }}"
+      loop: "{{ _expected_restart_patch_paths }}"
+      register: _restart_patch_stats
+
+    # Purpose: List restart patch files that are missing from selected overlays.
+    - name: "Pre-flight - Collect missing restart patches"
+      ansible.builtin.set_fact:
+        _missing_restart_patches: "{{ _restart_patch_stats.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+
+    # Purpose: Stop when restart patches are missing.
+    - name: "Pre-flight - Fail if restart patches are missing"
+      ansible.builtin.fail:
+        msg: >-
+          Missing restart patch files for {{ qmgr_name_normalized }}:
+          {{ _missing_restart_patches }}. Re-onboard or migrate the queue
+          manager to the restart-patch overlay layout first.
+      when: _missing_restart_patches | length > 0
+
+    # Purpose: Build the restart timestamp and reason written to the patch.
+    - name: "Restart - Resolve annotation values"
+      ansible.builtin.set_fact:
+        qmgr_restart_at: "{{ restart_at | default(now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'), true) }}"
+        qmgr_restart_reason: >-
+          {{
+            qmgr_restart_custom_reason
+            | default(custom_restart_reason, true)
+            | default(restart_reason, true)
+            | default('operator requested restart', true)
+            | trim
+          }}
+        qmgr_restart_requested_by: "{{ restart_requested_by | default('ansible-automation', true) | trim }}"
+
+    # Purpose: Check that restart patch values contain the requested timestamp and reason.
+    - name: "Pre-flight - Validate restart annotation values"
+      ansible.builtin.assert:
+        that:
+          - qmgr_restart_at is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')
+          - qmgr_restart_reason | length > 0
+          - qmgr_restart_reason | length <= 160
+          - qmgr_restart_reason is not search('[\r\n]')
+          - qmgr_restart_requested_by | length > 0
+          - qmgr_restart_requested_by | length <= 80
+          - qmgr_restart_requested_by is not search('[\r\n]')
+        fail_msg: |-
+          Restart request metadata is invalid.
+
+          restart_at must use UTC format like 2026-05-12T10:30:00Z.
+          restart_reason and restart_requested_by must be short single-line values.
+          Custom restart reason may be supplied as restart_reason,
+          custom_restart_reason, or qmgr_restart_custom_reason.
+          No Git changes were made.
+        quiet: true
+
+    # Purpose: Prepare the restart result shown to the operator.
+    - name: "Restart - Display summary"
+      ansible.builtin.debug:
+        msg:
+          - "Queue manager restart plan"
+          - "Queue Manager : {{ qmgr_name_normalized | upper }}"
+          - "Environment   : {{ env_upper }}"
+          - "Regions       : {{ _restart_target_regions | join(', ') }}"
+          - "Restart At    : {{ qmgr_restart_at }}"
+          - "Reason        :"
+          - "  {{ qmgr_restart_reason }}"
+          - "Patch Files   : {{ _expected_restart_patch_paths | length }}"
+          - "Target Repo   : {{ git_repo_url }}"
+          - "Target Branch : {{ target_branch }}"
+
+    # Purpose: Write restart annotation values into regional restart patch files.
+    - name: "Restart - Render restart patch files"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../../nativeha_templates/overlays/restart_patch.yaml.j2"
+        dest: "{{ git_work_dir }}/{{ item }}"
+        mode: "0644"
+      loop: "{{ _expected_restart_patch_paths }}"
+
+    # Purpose: Render and validate selected regional overlays using shared task.
+    - name: "Validation - Render selected regional overlays"
+      ansible.builtin.include_tasks: "{{ role_path }}/../gitops_publish/tasks/validate_kustomize_render.yaml"
+      vars:
+        _kustomize_overlay_paths: >-
+          {{
+            _restart_target_regions
+            | map('regex_replace', '^(.*)$', git_work_dir ~ '/' ~ qmgr_rel_path ~ '/overlays/\1')
+            | list
+          }}
+
+    # Purpose: Check that restart patch values contain the requested timestamp and reason.
+    - name: "Validation - Check rendered restart annotations"
+      ansible.builtin.assert:
+        that:
+          - "(restart_annotation_prefix ~ '/restart-at') in item.stdout"
+          - "qmgr_restart_at in item.stdout"
+        fail_msg: >-
+          Render validation failed for region {{ item.item }}. Expected restart
+          annotation {{ qmgr_restart_at }} in rendered QueueManager.
+      loop: "{{ _render_results.results }}"
+
+    # Purpose: Read Git status paths so only expected files are allowed.
+    - name: "Git - Check pending restart changes"  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: git status --porcelain
+      args:
+        chdir: "{{ git_work_dir }}"
+      register: _restart_git_status
+      changed_when: false
+      check_mode: false
+
+    # Purpose: Convert Git status output into paths checked against the allow-list.
+    - name: "Git - Classify pending restart change paths"
+      ansible.builtin.set_fact:
+        _restart_changed_paths: "{{ _restart_git_status.stdout_lines | map('regex_replace', '^.. +', '') | list }}"
+        _restart_unexpected_paths: >-
+          {{
+            (_restart_git_status.stdout_lines
+             | map('regex_replace', '^.. +', '')
+             | list)
+            | difference(_expected_restart_patch_paths)
+          }}
+
+    # Purpose: Stop when restart changed unexpected files.
+    - name: "Git - Fail if restart changed unexpected files"
+      ansible.builtin.assert:
+        that:
+          - _restart_unexpected_paths | length == 0
+        fail_msg: >-
+          Restart changed unexpected files: {{ _restart_unexpected_paths }}.
+          Expected only: {{ _expected_restart_patch_paths }}.
+
+    # Purpose: Prepare the title, summary, and validation text for the GitOps change.
+    - name: "Git - Prepare target repo publish metadata"
+      ansible.builtin.set_fact:
+        target_repo_pr_action_slug: "qmgr-restart"
+        target_repo_pr_action_label: "Restart QM"
+        target_repo_pr_repo_path: "{{ qmgr_rel_path }}"
+        target_repo_pr_summary: >-
+          Request operator-managed restart for {{ qmgr_name_normalized | upper }}
+          in {{ env_upper }} regions {{ _restart_target_regions | join(', ') }}.
+          Reason: {{ qmgr_restart_reason }}.
+        target_repo_pr_validation: >-
+          Rendered selected regional overlays and verified restart annotation
+          {{ qmgr_restart_at }} with reason "{{ qmgr_restart_reason }}".
+          Confirmed only restart patch files changed before adding CHANGELOG.md.
+
+    # Purpose: Publish the prepared GitOps changes by pull request or direct commit.
+    - name: "Git - Publish target repo changes"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: target_repo_publish
+
+    # Purpose: Record the workflow result for final reporting.
+    - name: "Restart - Complete"
+      ansible.builtin.debug:
+        msg:
+          - "Restart request complete"
+          - "Queue Manager : {{ qmgr_name_normalized | upper }}"
+          - "Environment   : {{ env_upper }}"
+          - "Regions       : {{ _restart_target_regions | join(', ') }}"
+          - "Restart At    : {{ qmgr_restart_at }}"
+          - "Reason        :"
+          - "  {{ qmgr_restart_reason }}"
+          - "Base Branch   : {{ target_branch }}"
+          - "Change Mode   : {{ target_repo_pr_result.mode | default(target_repo_change_mode | default('pull_request')) }}"
+          - "Publish Branch: {{ target_repo_pr_result.branch | default('not created') }}"
+          - "PR URL        : {{ target_repo_pr_result.pull_request_url | default('not created') }}"
+
+  rescue:
+    # Purpose: Save the real failure detail before the final report is built.
+    - name: "Rescue - Capture restart failure detail"
+      ansible.builtin.set_fact:
+        _qmgr_restart_failure_detail: >-
+          {{
+            ansible_failed_result.msg
+            | default(
+                ansible_failed_result.stderr
+                | default('Queue manager restart request failed before a detailed cause was returned.')
+              )
+            | string
+            | regex_replace('\n{3,}', '\n\n')
+            | trim
+          }}
+
+    # Purpose: Print the captured failure detail in the job log.
+    - name: "Rescue - Log restart failure"
+      ansible.builtin.debug:
+        msg:
+          - "Queue manager restart request failed"
+          - "Queue Manager : {{ qmgr_name | default('not supplied') | upper }}"
+          - "Environment   : {{ mq_environment | default('not supplied') | upper }}"
+          - "Root Cause    : {{ _qmgr_restart_failure_detail }}"
+
+    # Purpose: End the AAP job as failed after reporting the original problem.
+    - name: "Rescue - Re-raise restart failure"
+      ansible.builtin.fail:
+        msg: |-
+          Queue manager restart request failed.
+
+          {{ _qmgr_restart_failure_detail }}
+
+  always:
+    # Purpose: Release the direct publish lock before removing the temporary checkout.
+    - name: "Always - Release direct publish lock"
+      ansible.builtin.include_role:
+        name: gitops_publish
+        tasks_from: direct_publish_lock_release
+      when: _direct_publish_lock_acquired | default(false) | bool
+
+    # Purpose: Remove temporary files created during this run.
+    - name: "Always - Remove git working directory"
+      ansible.builtin.file:
+        path: "{{ git_work_dir }}"
+        state: absent
+      when:
+        - git_work_dir is defined
+        - git_work_dir_base is defined
+        - git_work_dir != git_work_dir_base
+      check_mode: false

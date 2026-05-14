@@ -1,0 +1,360 @@
+---
+# Validate that the target OpenShift namespace and Secret permissions are ready.
+# Namespace creation is intentionally out of scope for this automation.
+
+# Purpose: Write INI files into the queue manager GitOps layout.
+- name: "OpenShift - Initialize validation facts"
+  ansible.builtin.set_fact:
+    _ocp_missing_token_envs: []
+    _ocp_namespace_missing_regions: []
+    _ocp_secret_preflight_failures: []
+    _ocp_secret_access_failures: []
+
+# Purpose: Choose the OpenShift Secret verbs needed for this backend operation.
+- name: "OpenShift - Resolve required Secret permissions"
+  ansible.builtin.set_fact:
+    _ocp_secret_required_verbs_effective: >-
+      {{ ocp_secret_required_verbs | default(['get', 'create', 'update', 'patch'], true) }}
+
+# Purpose: Open or update the pull request for the prepared GitOps change.
+- name: "OpenShift - Resolve non-mutating preflight action"
+  ansible.builtin.set_fact:
+    _ocp_secret_preflight_action_effective: >-
+      {{
+        ocp_secret_preflight_action
+        | default(
+            'create'
+            if 'create' in _ocp_secret_required_verbs_effective
+            else (
+              'delete'
+              if 'delete' in _ocp_secret_required_verbs_effective
+              else 'read'
+            ),
+            true
+          )
+      }}
+
+# Purpose: Confirm the requested OpenShift preflight mode is supported.
+- name: "OpenShift - Validate preflight action"
+  ansible.builtin.assert:
+    that:
+      - _ocp_secret_preflight_action_effective in ['create', 'delete', 'read']
+    fail_msg: >-
+      OpenShift validation configuration is invalid. Supported preflight
+      actions are create, delete, or read.
+    quiet: true
+
+# Purpose: List missing files so the failure message names exact paths.
+- name: "OpenShift - Collect missing token configuration"
+  ansible.builtin.set_fact:
+    _ocp_missing_token_envs: "{{ _ocp_missing_token_envs + [item.token_env] }}"
+  loop: "{{ openshift_targets }}"
+  loop_control:
+    label: "{{ item.region }}"
+  when: item.api_key | default('', true) | length == 0
+  no_log: true
+
+# Purpose: Stop when any target OpenShift cluster has no API token.
+- name: "OpenShift - Fail when tokens are missing"
+  ansible.builtin.fail:
+    msg: >-
+      Missing OpenShift API token(s). Configure AAP credential injection for:
+      {{ _ocp_missing_token_envs | unique | join(', ') }}.
+  when: _ocp_missing_token_envs | length > 0
+
+# Purpose: Create or update the OpenShift Secret with approved certificate data.
+- name: "OpenShift - Dry-run Secret create preflight"
+  ansible.builtin.uri:
+    url: "{{ item.api_url }}/api/v1/namespaces/{{ namespace }}/secrets?dryRun=All"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ item.api_key }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nativeha-secret-preflight-do-not-create
+        namespace: "{{ namespace }}"
+      type: Opaque
+      stringData:
+        nativeha-preflight: ok
+    validate_certs: "{{ item.validate_certs | default(true) }}"
+    ca_path: "{{ item.ca_cert if (item.ca_cert | default('') | length > 0) else omit }}"
+    return_content: true
+    status_code:
+      - 200
+      - 201
+      - 202
+  loop: "{{ openshift_targets }}"
+  loop_control:
+    label: "{{ item.region }}"
+  register: _ocp_secret_preflight_create
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: _ocp_secret_preflight_action_effective == 'create'
+
+# Purpose: Delete the OpenShift Secret for the selected certificate backend.
+- name: "OpenShift - Dry-run Secret delete preflight"
+  ansible.builtin.uri:
+    url: "{{ item.api_url }}/api/v1/namespaces/{{ namespace }}/secrets/nativeha-secret-preflight-do-not-create?dryRun=All"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ item.api_key }}"
+      Accept: "application/json"
+    validate_certs: "{{ item.validate_certs | default(true) }}"
+    ca_path: "{{ item.ca_cert if (item.ca_cert | default('') | length > 0) else omit }}"
+    return_content: true
+    status_code:
+      - 200
+      - 202
+      - 404
+  loop: "{{ openshift_targets }}"
+  loop_control:
+    label: "{{ item.region }}"
+  register: _ocp_secret_preflight_delete
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: _ocp_secret_preflight_action_effective == 'delete'
+
+# Purpose: Open or update the pull request for the prepared GitOps change.
+- name: "OpenShift - Combine Secret preflight results"
+  ansible.builtin.set_fact:
+    _ocp_secret_preflight_results: >-
+      {{
+        (
+          (_ocp_secret_preflight_create.results | default([]))
+          + (_ocp_secret_preflight_delete.results | default([]))
+        )
+        | rejectattr('skipped', 'defined')
+        | list
+      }}
+
+# Purpose: List missing files so the failure message names exact paths.
+- name: "OpenShift - Collect missing namespace regions"
+  ansible.builtin.set_fact:
+    _ocp_namespace_missing_regions: >-
+      {{
+        _ocp_namespace_missing_regions + [
+          {
+            'region': item.item.region | default('unknown'),
+            'region_label': item.item.region_label | default(item.item.region | default('unknown')),
+            'status': item.status | default('unknown'),
+            'reason': item.json.reason | default(item.reason | default('NotFound'), true),
+            'message': _ocp_preflight_message
+          }
+        ]
+      }}
+  loop: "{{ _ocp_secret_preflight_results }}"
+  loop_control:
+    label: "{{ item.item.region | default('unknown') }}"
+  vars:
+    _ocp_preflight_message: >-
+      {{
+        (
+          item.json.message
+          if (item.json is defined and item.json.message is defined)
+          else item.content | default(item.msg | default('OpenShift namespace preflight failed.', true), true)
+        )
+        | string
+        | regex_replace('\n+', ' ')
+        | regex_replace('\s+', ' ')
+        | regex_replace('(?i)bearer\s+[^\s,;}]+', 'Bearer [redacted]')
+        | trim
+      }}
+  when: _ocp_preflight_message is search('(?i)namespaces.*not found')
+  no_log: true
+
+# Purpose: Open or update the pull request for the prepared GitOps change.
+- name: "OpenShift - Collect Secret preflight failures"
+  ansible.builtin.set_fact:
+    _ocp_secret_preflight_failures: >-
+      {{
+        _ocp_secret_preflight_failures + [
+          {
+            'region': item.item.region | default('unknown'),
+            'region_label': item.item.region_label | default(item.item.region | default('unknown')),
+            'status': item.status | default(item.code | default(item.rc | default('unknown'))),
+            'reason': item.json.reason | default(item.reason | default(item.status_reason | default('unknown'), true), true),
+            'message': _ocp_preflight_message
+          }
+        ]
+      }}
+  loop: "{{ _ocp_secret_preflight_results }}"
+  loop_control:
+    label: "{{ item.item.region | default('unknown') }}"
+  vars:
+    _ocp_preflight_message: >-
+      {{
+        (
+          item.json.message
+          if (item.json is defined and item.json.message is defined)
+          else item.content | default(item.msg | default('OpenShift namespace preflight failed.', true), true)
+        )
+        | string
+        | regex_replace('\n+', ' ')
+        | regex_replace('\s+', ' ')
+        | regex_replace('(?i)bearer\s+[^\s,;}]+', 'Bearer [redacted]')
+        | regex_replace(
+            '.*User \\"([^\\"]+)\\" cannot ([a-z]+) resource \\"([^\\"]+)\\".* namespace \\"([^\\"]+)\\".*',
+            'OpenShift denied access. User \1 cannot \2 \3 in namespace \4.'
+          )
+        | regex_replace(
+            '.*User "([^"]+)" cannot ([a-z]+) resource "([^"]+)".* namespace "([^"]+)".*',
+            'OpenShift denied access. User \1 cannot \2 \3 in namespace \4.'
+          )
+        | trim
+      }}
+    _ocp_preflight_status: "{{ item.status | default(0) | int }}"
+    _ocp_preflight_namespace_missing: "{{ _ocp_preflight_message is search('(?i)namespaces.*not found') }}"
+    _ocp_preflight_fake_secret_missing: "{{ _ocp_preflight_message is search('(?i)secrets.*nativeha-secret-preflight-do-not-create.*not found') }}"
+    _ocp_preflight_success: >-
+      {{
+        (
+          _ocp_secret_preflight_action_effective == 'create'
+          and (_ocp_preflight_status | int) in [200, 201, 202]
+        )
+        or (
+          _ocp_secret_preflight_action_effective == 'delete'
+          and (
+            (_ocp_preflight_status | int) in [200, 202]
+            or (
+              (_ocp_preflight_status | int) == 404
+              and (_ocp_preflight_fake_secret_missing | bool)
+            )
+          )
+        )
+      }}
+  when:
+    - not (_ocp_preflight_success | bool)
+    - not (_ocp_preflight_namespace_missing | bool)
+  no_log: true
+
+# Purpose: Stop when the target OpenShift namespace does not exist.
+- name: "OpenShift - Fail when namespace is missing"
+  ansible.builtin.fail:
+    msg: |-
+      OpenShift namespace is not ready for certificate management for {{ qmgr_name | upper }} in {{ env_upper }}.
+
+      Namespace: {{ namespace }}
+
+      Missing namespace region(s):
+      {% for failure in _ocp_namespace_missing_regions %}
+      - Region: {{ failure.region }}
+        Status: {{ failure.status | default('unknown') }}
+        Reason: {{ failure.reason | default('unknown') }}
+        Detail: OpenShift namespace {{ namespace }} was not found in region {{ failure.region }}.
+      {% endfor %}
+
+      Certificate processing was stopped before contacting Venafi. No Venafi action was taken, no OpenShift Secret was changed, and no registry update was made.
+      Please ask the OpenShift administrator to create namespace {{ namespace }} in the failed region(s), then rerun the job.
+  when: _ocp_namespace_missing_regions | length > 0
+
+# Purpose: Stop when the OpenShift dry-run Secret check fails.
+- name: "OpenShift - Fail when Secret preflight fails"
+  ansible.builtin.fail:
+    msg: |-
+      OpenShift is not ready for certificate Secret management for {{ qmgr_name | upper }} in {{ env_upper }}.
+
+      Namespace: {{ namespace }}
+      Preflight action: {{ _ocp_secret_preflight_action_effective }} Secret dry-run
+
+      Problem region(s):
+      {% for failure in _ocp_secret_preflight_failures %}
+      - Region: {{ failure.region }}
+        Status: {{ failure.status | default('unknown') }}
+        Reason: {{ failure.reason | default('unknown') }}
+        Detail: {{ failure.message }}
+      {% endfor %}
+
+      Certificate processing was stopped before contacting Venafi. No Venafi action was taken, no OpenShift Secret was changed, and no registry update was made.
+      Please ask the OpenShift administrator to verify the API URL, token, TLS/CA settings, namespace, and Secret permissions for the failed region(s).
+  when: _ocp_secret_preflight_failures | length > 0
+
+# Purpose: Confirm the OpenShift token can manage Secrets in each target namespace.
+- name: "OpenShift - Check Secret permissions"
+  kubernetes.core.k8s:
+    host: "{{ item.0.api_url }}"
+    api_key: "{{ item.0.api_key }}"
+    validate_certs: "{{ item.0.validate_certs | default(true) }}"
+    ca_cert: "{{ item.0.ca_cert if (item.0.ca_cert | default('') | length > 0) else omit }}"
+    state: present
+    definition:
+      apiVersion: authorization.k8s.io/v1
+      kind: SelfSubjectAccessReview
+      spec:
+        resourceAttributes:
+          namespace: "{{ namespace }}"
+          verb: "{{ item.1 }}"
+          group: ""
+          resource: secrets
+  loop: "{{ openshift_targets | product(_ocp_secret_required_verbs_effective) | list }}"
+  loop_control:
+    label: "{{ item.0.region }} {{ item.1 }} secrets"
+  register: _ocp_secret_access_reviews
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+# Purpose: Collect failed OpenShift permission checks into readable messages.
+- name: "OpenShift - Collect Secret permission failures"
+  ansible.builtin.set_fact:
+    _ocp_secret_access_failures: >-
+      {{
+        _ocp_secret_access_failures + [
+          {
+            'region': item.item.0.region,
+            'token_env': item.item.0.token_env,
+            'target_namespace': namespace,
+            'verb': item.item.1,
+            'reason': (
+              item.result.status.reason
+              | default(item.msg | default('OpenShift did not allow the permission check.', true), true)
+              | string
+              | regex_replace('\n+', ' ')
+              | regex_replace('\s+', ' ')
+              | regex_replace('(?i)(api[_-]?key|token|password)[:=][^\s,;}]+', '\1=[redacted]')
+              | trim
+            )
+          }
+        ]
+      }}
+  loop: "{{ _ocp_secret_access_reviews.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.region | default('unknown') }} {{ item.item.1 | default('unknown') }} secrets"
+  when:
+    - item.failed | default(false) | bool or
+      not (item.result.status.allowed | default(false) | bool)
+  no_log: true
+
+# Purpose: Stop when OpenShift Secret permissions are not enough for this operation.
+- name: "OpenShift - Fail when Secret permissions are missing"
+  ansible.builtin.fail:
+    msg: |-
+      OpenShift credential is not authorized for certificate Secret management for {{ qmgr_name | upper }} in {{ env_upper }}.
+
+      Target namespace: {{ namespace }}
+
+      Missing permission(s):
+      {% for failure in _ocp_secret_access_failures %}
+      - Region {{ failure.region }} uses {{ failure.token_env }} but cannot {{ failure.verb }} Secrets in namespace {{ failure.target_namespace }}.
+        Detail: {{ failure.reason }}
+      {% endfor %}
+
+      Any valid OpenShift token is acceptable, including a central or cluster-scoped token.
+      The credential only needs the listed Secret permissions in the target namespace.
+      Update the AAP OpenShift token credential or OpenShift RBAC, then rerun the job.
+      Certificate processing was stopped before contacting Venafi. No certificate backend changes were made.
+  when: _ocp_secret_access_failures | length > 0
+
+# Purpose: Record that OpenShift Secret permissions are ready.
+- name: "OpenShift - Secret permission validation passed"
+  ansible.builtin.debug:
+    msg: >-
+      OpenShift preflight passed for namespace {{ namespace }} in regions
+      {{ openshift_targets | map(attribute='region') | join(', ') }}.
+      Verified Secret permissions: {{ _ocp_secret_required_verbs_effective | join(', ') }}.

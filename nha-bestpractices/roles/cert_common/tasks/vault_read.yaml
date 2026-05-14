@@ -1,0 +1,17 @@
+---
+# Purpose: Read the existing OpenShift Secret before merge, delete, or diagnostics.
+- name: "Vault - Read certificate KV secret"
+  community.hashi_vault.vault_kv2_get:
+    url: "{{ vault_url }}"
+    auth_method: "{{ vault_cert_auth_method }}"
+    token: "{{ vault_cert_token if vault_cert_auth_method == 'token' else omit }}"
+    role_id: "{{ vault_cert_role_id if vault_cert_auth_method == 'approle' else omit }}"
+    secret_id: "{{ vault_cert_secret_id if vault_cert_auth_method == 'approle' else omit }}"
+    validate_certs: "{{ vault_validate_certs | default(true) }}"
+    engine_mount_point: "{{ vault_cert_mount_point }}"
+    namespace: "{{ vault_namespace if (vault_namespace | default('') | length > 0) else omit }}"
+    path: "{{ _vault_cert_path }}"
+    timeout: "{{ nativeha_api_timeout | default(45) | int }}"
+  register: _vault_read
+  failed_when: false
+  no_log: true

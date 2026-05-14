@@ -1,0 +1,36 @@
+{#
+What it is:
+  Vault Secrets Operator VaultConnection custom resource.
+Purpose:
+  Provides the Vault server address and optional CA secret reference for VSO.
+Variables coming from:
+  qmgr onboarding facts: namespace, qmgr_name.
+  global_vars: vault_url, vso_vault_connection_name, vso_vault_skip_tls,
+  vso_vault_ca_secret.
+Produces:
+  base/secrets/vault_connection.yaml.
+#}
+---
+# vaultconnection.yaml - VSO VaultConnection CR
+# Defines the connection to HashiCorp Vault for the Vault Secrets Operator.
+# One per QM namespace (namespace-scoped).
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultConnection
+metadata:
+  name: {{ vso_vault_connection_name }}
+  namespace: {{ namespace }}
+  labels:
+    app.kubernetes.io/name: {{ qmgr_name }}
+    app.kubernetes.io/managed-by: ansible-automation
+spec:
+  address: "{{ vault_url }}"
+  skipTLSVerify: {{ vso_vault_skip_tls | default(false) | bool | lower }}
+{#
+Section:
+  CA secret is optional. Empty values are trimmed and omitted so clusters with
+  public or platform-trusted Vault TLS do not get a bad caCertSecretRef.
+#}
+{% set _vso_vault_ca_secret = vso_vault_ca_secret | default('') | string | trim %}
+{% if _vso_vault_ca_secret | length > 0 %}
+  caCertSecretRef: "{{ _vso_vault_ca_secret }}"
+{% endif %}

@@ -1,0 +1,144 @@
+---
+# Verify Vault KV access before requesting or revoking certificate material.
+# This task is intentionally non-mutating: it uses Vault self-capabilities only.
+
+# Purpose: Start clean Vault permission-check results.
+- name: "Vault - Initialize preflight facts"
+  ansible.builtin.set_fact:
+    _vault_preflight_paths: []
+    _vault_preflight_failures: []
+    _vault_preflight_required_capabilities_effective: >-
+      {{ vault_preflight_required_capabilities | default(['create', 'update', 'read'], true) }}
+
+# Purpose: Build the normalized target list used by certificate roles.
+- name: "Vault - Build target capability paths"
+  ansible.builtin.set_fact:
+    _vault_preflight_paths: >-
+      {{
+        _vault_preflight_paths + [
+          {
+            'cert_type': item,
+            'kv_path': vault_cert_base_path ~ '/' ~ cert_type_vault_subpath[item],
+            'data_path': vault_cert_mount_point ~ '/data/' ~ vault_cert_base_path ~ '/' ~ cert_type_vault_subpath[item]
+          }
+        ]
+      }}
+  loop: "{{ active_cert_types }}"
+  loop_control:
+    label: "{{ item }}"
+
+# Purpose: Add any non-leaf certificate Vault paths needed by this workflow.
+- name: "Vault - Add extra capability paths"
+  ansible.builtin.set_fact:
+    _vault_preflight_paths: >-
+      {{
+        _vault_preflight_paths + [
+          {
+            'cert_type': item.cert_type | default('extra'),
+            'kv_path': item.kv_path,
+            'data_path': vault_cert_mount_point ~ '/data/' ~ item.kv_path
+          }
+        ]
+      }}
+  loop: "{{ vault_preflight_extra_paths | default([]) }}"
+  loop_control:
+    label: "{{ item.cert_type | default(item.kv_path | default('extra')) }}"
+
+# Purpose: Confirm Vault permissions before reading or writing certificate paths.
+- name: "Vault - Check target KV capabilities"
+  community.hashi_vault.vault_write:
+    url: "{{ vault_url }}"
+    auth_method: "{{ vault_cert_auth_method }}"
+    token: "{{ vault_cert_token if vault_cert_auth_method == 'token' else omit }}"
+    role_id: "{{ vault_cert_role_id if vault_cert_auth_method == 'approle' else omit }}"
+    secret_id: "{{ vault_cert_secret_id if vault_cert_auth_method == 'approle' else omit }}"
+    validate_certs: "{{ vault_validate_certs | default(true) }}"
+    namespace: "{{ vault_namespace if (vault_namespace | default('') | length > 0) else omit }}"
+    path: sys/capabilities-self
+    data:
+      path: "{{ item.data_path }}"
+    timeout: "{{ nativeha_api_timeout | default(45) | int }}"
+  loop: "{{ _vault_preflight_paths }}"
+  loop_control:
+    label: "{{ item.cert_type }}"
+  register: _vault_preflight_capabilities
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+# Purpose: Convert failed module results into safe, readable failure messages.
+- name: "Vault - Collect capability failures"
+  ansible.builtin.set_fact:
+    _vault_preflight_failures: >-
+      {{
+        _vault_preflight_failures + [
+          {
+            'cert_type': item.item.cert_type,
+            'kv_path': item.item.kv_path,
+            'data_path': item.item.data_path,
+            'capabilities': _vault_capabilities,
+            'missing_capabilities': _vault_missing_capabilities,
+            'detail': _vault_failure_detail
+          }
+        ]
+      }}
+  loop: "{{ _vault_preflight_capabilities.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.cert_type | default('unknown') }}"
+  vars:
+    _vault_capabilities: "{{ item.data.capabilities | default([]) }}"
+    _vault_missing_capabilities: "{{ _vault_preflight_required_capabilities_effective | difference(_vault_capabilities) }}"
+    _vault_raw_failure_detail: >-
+      {{
+        item.msg
+        | default(item.errors | default(item.data.errors | default(['Vault capability check did not return the required permissions.'], true), true), true)
+        | string
+      }}
+    _vault_failure_detail: >-
+      {{
+        (
+          'Vault rejected the token or the permission check could not complete. '
+          ~ 'Verify the Vault URL, token/AppRole, TLS settings, and '
+          ~ 'sys/capabilities-self access.'
+          if _vault_raw_failure_detail is search('^MODULE FAILURE')
+          else _vault_raw_failure_detail
+        )
+        | regex_replace('\n+', ' ')
+        | regex_replace('\s+', ' ')
+        | regex_replace('(?i)(token|password|secret_id|secret-id)[:=][^\s,;}]+', '\1=[redacted]')
+        | trim
+      }}
+  when:
+    - item.failed | default(false) | bool or _vault_missing_capabilities | length > 0
+  no_log: true
+
+# Purpose: Stop when target kv access is not ready.
+- name: "Vault - Fail when target KV access is not ready"
+  ansible.builtin.fail:
+    msg: |-
+      Vault is not ready for certificate management for {{ qmgr_name | upper }} in {{ env_upper }}.
+
+      Vault URL: {{ vault_url }}
+      KV mount: {{ vault_cert_mount_point }}
+      Base path: {{ vault_cert_base_path }}
+
+      Problem path(s):
+      {% for failure in _vault_preflight_failures %}
+      - {{ failure.cert_type }}: {{ failure.kv_path }}
+        Required capabilities: {{ _vault_preflight_required_capabilities_effective | join(', ') }}
+        Current capabilities: {{ failure.capabilities | join(', ') | default('none', true) }}
+        Missing capabilities: {{ failure.missing_capabilities | join(', ') | default('unknown', true) }}
+        Detail: {{ failure.detail }}
+      {% endfor %}
+
+      Certificate processing was stopped before contacting Venafi. No Venafi action was taken, no Vault secret was changed, and no registry update was made.
+      Please ask the Vault administrator to grant the listed capabilities on the KV v2 data path(s), then rerun the job.
+  when: _vault_preflight_failures | length > 0
+
+# Purpose: Record that Vault permissions are ready for the requested operation.
+- name: "Vault - Preflight passed"
+  ansible.builtin.debug:
+    msg: >-
+      Vault preflight passed for {{ qmgr_name | upper }} in {{ env_upper }}.
+      Verified {{ _vault_preflight_required_capabilities_effective | join(', ') }}
+      on {{ _vault_preflight_paths | length }} Vault path(s).

@@ -1,0 +1,82 @@
+---
+# Purpose: Delete selected certificate data from Vault.
+- name: "Step 5 - Delete from Vault"
+  community.hashi_vault.vault_kv2_delete:
+    url: "{{ vault_url }}"
+    auth_method: "{{ vault_cert_auth_method }}"
+    token: "{{ vault_cert_token if vault_cert_auth_method == 'token' else omit }}"
+    role_id: "{{ vault_cert_role_id if vault_cert_auth_method == 'approle' else omit }}"
+    secret_id: "{{ vault_cert_secret_id if vault_cert_auth_method == 'approle' else omit }}"
+    validate_certs: "{{ vault_validate_certs | default(true) }}"
+    engine_mount_point: "{{ vault_cert_mount_point }}"
+    namespace: "{{ vault_namespace if (vault_namespace | default('') | length > 0) else omit }}"
+    path: "{{ vault_cert_base_path }}/{{ cert_type_vault_subpath[item] }}"
+    timeout: "{{ nativeha_api_timeout | default(45) | int }}"
+  loop: "{{ active_cert_types }}"
+  loop_control:
+    label: "{{ item }}"
+  register: _vault_delete_results
+  failed_when: false
+  no_log: true
+
+# Purpose: Start clean tracking data for this part of the workflow.
+- name: "Step 5 - Initialize Vault delete failures"
+  ansible.builtin.set_fact:
+    _vault_delete_failures: []
+
+# Purpose: Convert failed module results into safe, readable failure messages.
+- name: "Step 5 - Collect Vault delete failures"
+  ansible.builtin.set_fact:
+    _vault_delete_failures: >-
+      {{
+        _vault_delete_failures + [
+          {
+            'cert_type': item.item | default('unknown'),
+            'path': vault_cert_base_path ~ '/' ~ cert_type_vault_subpath[item.item | default('app')],
+            'detail': (
+              item.msg
+              | default(item.errors | default('Vault delete failed without a module message.', true), true)
+              | string
+              | regex_replace('\n+', ' ')
+              | regex_replace('\s+', ' ')
+              | regex_replace('(?i)(token|password|secret_id|secret-id)[:=][^\s,;}]+', '\1=[redacted]')
+              | trim
+            )
+          }
+        ]
+      }}
+  loop: "{{ _vault_delete_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when: >-
+    item.failed | default(false) | bool
+    or item.status | default(0) | int >= 400
+    or item.exception is defined
+    or (
+      item.msg is defined
+      and item.msg | string | trim is search('(?i)(failed|forbidden|permission|unauthorized|invalid|denied|cannot|unable|error)')
+    )
+  no_log: true
+
+# Purpose: Stop when vault delete failed.
+- name: "Step 5 - Fail if Vault delete failed"
+  ansible.builtin.fail:
+    msg: |-
+      Vault certificate deletion failed for {{ qmgr_name | upper }}.
+
+      Vault URL: {{ vault_url }}
+      KV mount: {{ vault_cert_mount_point }}
+
+      Failed path(s):
+      {% for failure in _vault_delete_failures %}
+      - {{ failure.cert_type }}: {{ failure.path }}
+        Detail: {{ failure.detail }}
+      {% endfor %}
+
+      Certificate offboarding stopped before the registry was updated. Please verify Vault access and rerun.
+  when: _vault_delete_failures | length > 0
+
+# Purpose: Record that Vault delete finished for this certificate type.
+- name: Step 5 - Vault purge complete
+  ansible.builtin.debug:
+    msg: "Deleted {{ active_cert_types | length }} path(s) under {{ vault_cert_base_path }}/"

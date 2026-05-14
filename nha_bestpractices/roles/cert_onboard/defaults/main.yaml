@@ -1,8 +1,0 @@
----
-# Minimal inputs are supplied by AAP survey or --extra-vars:
-# app_sys_id, mq_environment, and qmgr_name.
-# Optional temporary namespace override:
-# custom_openshift_namespace.
-
-cert_force_renew: false  # noqa var-naming[no-role-prefix]
-cert_samplecertca_cross_check_on_skip: false  # noqa var-naming[no-role-prefix]

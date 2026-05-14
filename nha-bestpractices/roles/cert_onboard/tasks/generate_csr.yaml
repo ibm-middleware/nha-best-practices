@@ -1,0 +1,150 @@
+---
+#  generate_csr.yaml - Private Key + CSR Generation
+#
+#  PURPOSE:
+#    Generates a private key and Certificate Signing Request
+#    for a single cert type. Uses community.crypto modules
+#    (no external API calls - fully offline).
+#
+#  CALLED WITH:
+#    cert_type  - loop var: app | nha | nhacrr
+#
+#  SAN STRATEGY (verified from live MQ Operator cluster):
+#
+#    APP cert (secret: {qmgr}-app-pki):
+#      Used by: Client connections (1414) + Web console (9443)
+#      SANs:
+#        - ClusterIP service: {qmgr}-ibm-mq (short + FQDN variants)
+#        - Route hostnames:   {qmgr}-ibm-mq-qm-{ns}.{domain}    (clients)
+#                             {qmgr}-ibm-mq-web-{ns}.{domain}    (web UI)
+#
+#    NHA cert (secret: {qmgr}-nha-tls):
+#      Used by: NativeHA log replication between pods (port 9414)
+#      SANs:
+#        - Per-replica ClusterIP services:
+#          {qmgr}-ibm-mq-replica-0 (short + FQDN)
+#          {qmgr}-ibm-mq-replica-1
+#          {qmgr}-ibm-mq-replica-2
+#        Note: The operator does NOT use a headless service.
+#              It creates per-pod ClusterIP services instead.
+#
+#    NHA CRR cert (secret: {qmgr}-nhacrr-tls):
+#      Used by: Cross-region replication (port 9415)
+#      SANs:
+#        - Route hostnames: {qmgr}-ibm-mq-nhacrr-{ns}.{domain}
+#          on ALL cluster domains (cert must be valid on both clusters)
+#
+
+
+# Purpose: Start clean tracking data for this part of the workflow.
+- name: Initialize SAN list for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans:
+      - "DNS:{{ cert_common_name }}"
+
+# APP certificate SANs.
+
+# Purpose: Add queue manager service DNS names to the certificate SAN list.
+- name: Add ClusterIP service SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: >-
+      {{ _current_sans + [
+           'DNS:' ~ qmgr_name ~ '-ibm-mq',
+           'DNS:' ~ qmgr_name ~ '-ibm-mq.' ~ namespace,
+           'DNS:' ~ qmgr_name ~ '-ibm-mq.' ~ namespace ~ '.svc',
+           'DNS:' ~ qmgr_name ~ '-ibm-mq.' ~ namespace ~ '.svc.cluster.local'
+         ] }}
+  when: cert_type == 'app'
+
+# Purpose: Add route hostnames to the certificate SAN list.
+- name: Add route SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: >-
+      {{ _current_sans + [
+           'DNS:' ~ qmgr_name ~ '-' ~ item.0 ~ '-' ~ namespace ~ '.' ~ item.1
+         ] }}
+  loop: "{{ ['ibm-mq-qm', 'ibm-mq-web'] | product(cluster_domains) | list }}"
+  loop_control:
+    label: "{{ qmgr_name }}-{{ item.0 }}-{{ namespace }}.{{ item.1 }}"
+  when: cert_type == 'app'
+
+# Purpose: Add route hostnames to the certificate SAN list.
+- name: Add custom client route SAN for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: "{{ _current_sans + ['DNS:' ~ qmgr_name ~ '.' ~ custom_client_dns_domain] }}"
+  when:
+    - cert_type == 'app'
+    - custom_client_route_enabled | default(false) | bool
+    - custom_client_route_include_san | default(true) | bool
+    - custom_client_dns_domain | default('', true) | trim | length > 0
+
+# NativeHA certificate SANs.
+
+# Purpose: Add NativeHA replica service names to the certificate SAN list.
+- name: Add NHA per-replica service SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: >-
+      {{ _current_sans + [
+           'DNS:' ~ qmgr_name ~ '-ibm-mq-replica-' ~ item | string,
+           'DNS:' ~ qmgr_name ~ '-ibm-mq-replica-' ~ item | string ~ '.' ~ namespace ~ '.svc.cluster.local'
+         ] }}
+  loop: "{{ range(0, 3) | list }}"
+  when: cert_type == 'nha'
+
+# NativeHA CRR certificate SANs.
+
+# Purpose: Add route hostnames to the certificate SAN list.
+- name: Add NHA CRR route SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: >-
+      {{ _current_sans + [
+           'DNS:' ~ qmgr_name ~ '-' ~ item.0 ~ '-' ~ namespace ~ '.' ~ item.1
+         ] }}
+  loop: "{{ ['ibm-mq-nhacrr'] | product(cluster_domains) | list }}"
+  loop_control:
+    label: "{{ qmgr_name }}-{{ item.0 }}-{{ namespace }}.{{ item.1 }}"
+  when: cert_type == 'nhacrr'
+
+# Purpose: Add operator-configured extra hostnames to the certificate SAN list.
+- name: Append extra SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: "{{ _current_sans + qmgr_extra_sans }}"
+  when: qmgr_extra_sans | length > 0
+
+# Purpose: Add operator-configured extra hostnames to the certificate SAN list.
+- name: Append certificate-type extra SANs for {{ cert_type }}
+  ansible.builtin.set_fact:
+    _current_sans: "{{ _current_sans + (qmgr_extra_sans_by_type[cert_type] | default([])) }}"
+  when: qmgr_extra_sans_by_type[cert_type] | default([]) | length > 0
+
+# Purpose: Print requested certificate hostnames for operator review.
+- name: Display SAN list for {{ cert_type }}
+  ansible.builtin.debug:
+    msg: "{{ _current_sans | unique | list | length }} SANs: {{ _current_sans | unique | list }}"
+
+# Purpose: Private key for {{ cert_type }}.
+- name: Generate private key for {{ cert_type }}
+  community.crypto.openssl_privatekey:
+    path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.key"
+    size: "{{ cert_key_size }}"
+    type: "{{ cert_key_type }}"
+    state: present
+
+# Purpose: Generate the CSR used to request the certificate from Venafi.
+- name: Generate CSR for {{ cert_type }}
+  community.crypto.openssl_csr:
+    path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.csr"
+    privatekey_path: "{{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.key"
+    common_name: "{{ cert_common_name }}"
+    country_name: "{{ cert_country_name }}"
+    state_or_province_name: "{{ cert_state_or_province }}"
+    locality_name: "{{ cert_locality_name }}"
+    organization_name: "{{ cert_organization_name }}"
+    organizational_unit_name: "{{ cert_organizational_unit }}"
+    subject_alt_name: "{{ _current_sans | unique | list }}"
+    state: present
+
+# Purpose: Generate the CSR used to request the certificate from Venafi.
+- name: CSR generated for {{ cert_type }}
+  ansible.builtin.debug:
+    msg: "Key + CSR -> {{ cert_tmp_dir.path }}/{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}.csr"

@@ -1,0 +1,112 @@
+---
+# Build one normalized target dictionary for a queue manager.
+
+# Purpose: Derive queue manager, namespace, and certificate names from shared naming maps.
+- name: "Target build - Derive identity for {{ cert_target_qmgr_name }}"
+  ansible.builtin.set_fact:
+    _target_sequence: "{{ cert_target_qmgr_name[-3:] }}"
+    _target_qmgr_name: "{{ cert_target_qmgr_name | lower }}"
+    _target_qmgr_name_upper: "{{ cert_target_qmgr_name | upper }}"
+    _target_namespace: >-
+      {{
+        custom_openshift_namespace_effective
+        if (custom_openshift_namespace_enabled | default(false) | bool)
+        else (app_prefix ~ '-mq-' ~ env_ns_code ~ '-' ~ cert_target_qmgr_name[-3:])
+      }}
+    _target_namespace_source: >-
+      {{
+        'custom_openshift_namespace'
+        if (custom_openshift_namespace_enabled | default(false) | bool)
+        else 'derived'
+      }}
+    _target_zone: "{{ 'hra' if app_prefix in vault_security_zones.hra.apps else 'sra' }}"
+
+# Purpose: Derive the GitOps repository path for the selected queue manager.
+- name: "Target build - Derive Vault paths for {{ cert_target_qmgr_name }}"
+  ansible.builtin.set_fact:
+    _target_vault_namespace: "{{ vault_security_zones[_target_zone].label | default('') }}"
+    _target_vault_mount: "{{ vault_security_zones[_target_zone].mount }}"
+    _target_vault_base_path: "{{ app_prefix }}/ibm-mq/{{ env_upper }}/{{ _target_namespace }}/{{ _target_qmgr_name_upper }}"
+    _target_vault_client_trust_shared_path: "{{ mq_client_trust_vault_shared_path | default(app_prefix ~ '/ibm-mq/shared') }}"
+
+# Purpose: Start clean tracking data for this part of the workflow.
+- name: "Target build - Initialize OpenShift targets for {{ cert_target_qmgr_name }}"
+  ansible.builtin.set_fact:
+    _target_openshift_targets: []
+
+# Purpose: Add one OpenShift cluster target for certificate backend work.
+- name: "Target build - Add OpenShift target"
+  ansible.builtin.set_fact:
+    _target_openshift_targets: >-
+      {{
+        _target_openshift_targets + [
+          {
+            'region': cert_region,
+            'region_label': regions[cert_region].region_label,
+            'api_url': openshift_clusters[env_upper][cert_region].api_url,
+            'cluster_domain': openshift_clusters[env_upper][cert_region].cluster_domain,
+            'token_env': openshift_clusters[env_upper][cert_region].token_env,
+            'api_key': (
+              lookup('ansible.builtin.env', 'OPENSHIFT_LOGIN_TOKEN', default='')
+              | default(lookup('ansible.builtin.env', 'MQ_OCP_ALL_TOKEN', default=''), true)
+              | default(lookup('ansible.builtin.env', 'OCP_LOGIN_TOKEN', default=''), true)
+              | default(lookup('ansible.builtin.env', 'OPENSHIFT_TOKEN', default=''), true)
+              | default(lookup('ansible.builtin.env', 'OPENSHIFT_BEARER_TOKEN', default=''), true)
+              | default(lookup('ansible.builtin.env', 'K8S_AUTH_API_KEY', default=''), true)
+              | default(lookup(
+                  'ansible.builtin.env',
+                  openshift_clusters[env_upper][cert_region].token_env,
+                  default=''
+                ), true)
+            ),
+            'validate_certs': openshift_clusters[env_upper][cert_region].validate_certs | default(true),
+            'ca_cert': (
+              lookup(
+                'ansible.builtin.env',
+                openshift_clusters[env_upper][cert_region].ca_cert_env,
+                default=''
+              )
+              if openshift_clusters[env_upper][cert_region].ca_cert_env is defined
+              else ''
+            )
+          }
+        ]
+      }}
+  loop: "{{ target_regions }}"
+  loop_control:
+    loop_var: cert_region
+  no_log: true
+
+# Purpose: Add one normalized queue manager target to the work list.
+- name: "Target build - Append normalized target {{ cert_target_qmgr_name }}"
+  ansible.builtin.set_fact:
+    cert_targets: >-
+      {{
+        cert_targets + [
+          {
+            'app_sys_id': app_prefix,
+            'app_prefix': app_prefix,
+            'environment': env_upper,
+            'mq_environment': env_upper,
+            'env_code': env_code,
+            'env_ns_code': env_ns_code,
+            'qmgr_name': _target_qmgr_name,
+            'qmgr_name_upper': _target_qmgr_name_upper,
+            'namespace': _target_namespace,
+            'namespace_source': _target_namespace_source,
+            'sequence_number': _target_sequence,
+            'instance_type': instance_type,
+            'cert_profile': instance_cert_map[instance_type],
+            'target_regions': target_regions,
+            'cluster_domains': _target_openshift_targets | map(attribute='cluster_domain') | list,
+            'openshift_targets': _target_openshift_targets,
+            'zone': _target_zone,
+            'vault_namespace': _target_vault_namespace,
+            'vault_cert_mount_point': _target_vault_mount,
+            'vault_cert_base_path': _target_vault_base_path,
+            'vault_client_trust_shared_path': _target_vault_client_trust_shared_path,
+            'delivery_backend': cert_delivery_backend_effective
+          }
+        ]
+      }}
+  no_log: true

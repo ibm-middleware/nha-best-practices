@@ -1,0 +1,45 @@
+{#
+What it is:
+  Immutable regional JSON 6902 patch for CRR identity and remote addresses.
+Purpose:
+  Applies region-specific CRR topology over the placeholder base CR. This file
+  is generated during onboarding and must not be edited by Day-2 role switch;
+  only the role patch changes during a Live/Recovery transition.
+Variables coming from:
+  qmgr onboarding facts: current_region, qmgr_name, namespace, env_upper,
+  _target_regions.
+  global_vars: regions, openshift_clusters, crr_replication_port.
+Produces:
+  overlays/<region>/<region_label>-patch-topology.yaml.
+#}
+---
+# {{ regions[current_region].region_label }}-patch-topology.yaml
+# Immutable regional CRR topology generated at onboarding.
+
+# Labels
+- op: replace
+  path: /metadata/labels/app.kubernetes.io~1instance
+  value: {{ qmgr_name }}-{{ current_region }}
+- op: replace
+  path: /metadata/labels/mq.ibm.com~1region
+  value: {{ current_region }}
+
+# NativeHA Group - local identity
+- op: replace
+  path: /spec/queueManager/availability/nativeHAGroups/local/name
+  value: {{ current_region }}
+
+# NativeHA Group - immutable remotes
+{#
+Section:
+  One remote entry is generated for every configured environment region except
+  the current region.
+#}
+{% for rname in _target_regions if rname != current_region %}
+- op: replace
+  path: /spec/queueManager/availability/nativeHAGroups/remotes/{{ loop.index0 }}/name
+  value: {{ rname }}
+- op: replace
+  path: /spec/queueManager/availability/nativeHAGroups/remotes/{{ loop.index0 }}/addresses/0
+  value: "{{ qmgr_name }}-ibm-mq-nhacrr-{{ namespace }}.{{ openshift_clusters[env_upper][rname].cluster_domain }}:{{ crr_replication_port }}"
+{% endfor %}

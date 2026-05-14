@@ -1,0 +1,29 @@
+---
+# Purpose: Get a Venafi token before requesting or checking certificates.
+- name: "Venafi - Authenticate"
+  ansible.builtin.uri:
+    url: "{{ venafi_url }}{{ venafi_oauth }}"
+    method: POST
+    body_format: json
+    body:
+      username: "{{ venafi_username }}"
+      password: "{{ venafi_password }}"
+      client_id: "{{ venafi_client_id }}"
+      scope: "{{ venafi_scope }}"
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    validate_certs: "{{ venafi_validate_certs }}"
+    status_code: [200, 201]
+    timeout: "{{ nativeha_api_timeout | default(45) | int }}"
+    use_netrc: false
+    unredirected_headers:
+      - Authorization
+  register: _venafi_auth
+  no_log: true
+
+# Purpose: Save the Venafi token without printing it.
+- name: "Venafi - Store bearer token"
+  ansible.builtin.set_fact:
+    venafi_token: "{{ _venafi_auth.json.access_token }}"
+  no_log: true

@@ -1,0 +1,42 @@
+{#
+What it is:
+  Vault Secrets Operator VaultAuth custom resource.
+Purpose:
+  Defines how VSO authenticates to Vault using Kubernetes auth for the queue
+  manager namespace.
+Variables coming from:
+  qmgr onboarding facts: namespace, qmgr_name, vault_namespace.
+  global_vars and zone derivation: vso_vault_auth_name,
+  vso_vault_connection_name, vso_kubernetes_auth_mount, vso_vault_role,
+  vso_service_account.
+Produces:
+  base/secrets/vault_auth.yaml.
+#}
+---
+# vaultauth.yaml - VSO VaultAuth CR
+# Authenticates the Vault Secrets Operator to Vault using Kubernetes auth method.
+# The Vault namespace/mount come from qmgr onboarding's derived `_zone`,
+# which is computed from `app_sys_id` against `vault_security_zones`.
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultAuth
+metadata:
+  name: {{ vso_vault_auth_name }}
+  namespace: {{ namespace }}
+  labels:
+    app.kubernetes.io/name: {{ qmgr_name }}
+    app.kubernetes.io/managed-by: ansible-automation
+spec:
+  vaultConnectionRef: {{ vso_vault_connection_name }}
+  method: kubernetes
+  mount: {{ vso_kubernetes_auth_mount }}
+{#
+Section:
+  Vault Enterprise namespace is optional. It is emitted only when the selected
+  security zone defines one.
+#}
+{% if vault_namespace %}
+  namespace: {{ vault_namespace }}
+{% endif %}
+  kubernetes:
+    role: {{ vso_vault_role }}
+    serviceAccount: {{ vso_service_account }}

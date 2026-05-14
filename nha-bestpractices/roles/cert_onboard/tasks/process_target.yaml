@@ -1,0 +1,350 @@
+---
+# Process one resolved queue manager target.
+
+# Purpose: Load the selected queue manager facts for this target.
+- name: "Cert target - Set context"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/set_current_target.yaml"
+
+# Purpose: Confirm the target has a supported certificate delivery backend.
+- name: "Cert target - Validate target and backend"
+  ansible.builtin.include_tasks: validate.yaml
+
+# Purpose: Confirm namespace access before reading or writing OpenShift Secrets.
+- name: "Cert target - Validate OpenShift namespaces"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_store_ocp/tasks/validate_namespaces.yaml"
+  when: cert_delivery_backend_effective == 'openshift_secret'
+
+# Purpose: Confirm Vault paths are present before Vault certificate storage.
+- name: "Cert target - Validate Vault storage"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/vault_preflight.yaml"
+  vars:
+    vault_preflight_extra_paths:
+      - cert_type: "{{ mq_client_trust_source_name | default('clientcerts') }}"
+        kv_path: "{{ vault_client_trust_shared_path | default(mq_client_trust_vault_shared_path | default(app_prefix ~ '/ibm-mq/shared')) }}"
+  when: cert_delivery_backend_effective == 'vault'
+
+# Purpose: Read certificate inventory before deciding what must change.
+- name: "Cert target - Read existing certificate registry"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/read_registry.yaml"
+  when: cert_registry_enabled | default(false) | bool
+
+# Purpose: Start an empty registry structure when no inventory exists yet.
+- name: "Cert target - Initialize empty certificate registry"
+  ansible.builtin.set_fact:
+    cert_registry: {}
+  when: not (cert_registry_enabled | default(false) | bool)
+
+# Purpose: Preserve existing registry cert data.
+- name: "Cert target - Preserve existing registry cert data"
+  ansible.builtin.set_fact:
+    _existing_registry_cert_data: >-
+      {{
+        cert_registry[qmgr_name].certs | default({})
+        if qmgr_name in cert_registry
+        else {}
+      }}
+
+# Purpose: Build the normalized target list used by certificate roles.
+- name: "Cert target - Build registry OpenShift targets"
+  ansible.builtin.set_fact:
+    _registry_openshift_targets: []
+
+# Purpose: Add each OpenShift target region to the certificate inventory entry.
+- name: "Cert target - Add registry OpenShift target"
+  ansible.builtin.set_fact:
+    _registry_openshift_targets: >-
+      {{
+        _registry_openshift_targets + [
+          {
+            'region': item.region,
+            'region_label': item.region_label,
+            'api_url': item.api_url,
+            'cluster_domain': item.cluster_domain,
+            'namespace': namespace,
+            'token_env': item.token_env
+          }
+        ]
+      }}
+  loop: "{{ openshift_targets }}"
+  loop_control:
+    label: "{{ item.region }}"
+  no_log: true
+
+# Purpose: Group one target certificate lifecycle so failures include target context.
+- name: "Cert target - Certificate lifecycle"
+  block:
+    # Purpose: Ensure the required output directory exists before writing files.
+    - name: "Cert target - Create temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: _mq_certs
+      register: cert_tmp_dir
+
+    # Purpose: Start clean tracking data for this part of the workflow.
+    - name: "Cert target - Initialize action trackers"
+      ansible.builtin.set_fact:
+        cert_actions: {}
+        cert_repair_material: {}
+        registry_cert_data: "{{ _existing_registry_cert_data }}"
+
+    # Purpose: Stop early if Venafi connection settings are incomplete.
+    - name: "Cert target - Validate certificate provider settings for cross-check"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/validate_venafi_config.yaml"
+      when: cert_venafi_cross_check_on_skip | default(false) | bool
+
+    # Purpose: Get a Venafi token before certificate provider checks.
+    - name: "Cert target - Authenticate to certificate provider for cross-check"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/venafi_auth.yaml"
+      when: cert_venafi_cross_check_on_skip | default(false) | bool
+
+    # Purpose: Check existing backend certificates before deciding request, renew, or skip.
+    - name: "Cert target - Check existing certs"
+      ansible.builtin.include_tasks: check_existing_cert.yaml
+      loop: "{{ active_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+
+    # Purpose: Split certificate types into request, repair, skip, and registry-update groups.
+    - name: "Cert target - Determine action groups"
+      ansible.builtin.set_fact:
+        venafi_actionable_cert_types: >-
+          {{
+            cert_actions | dict2items
+            | selectattr('value.action', 'match', '^(request_new|renew)$')
+            | map(attribute='key')
+            | list
+          }}
+        backend_repair_cert_types: >-
+          {{
+            cert_actions | dict2items
+            | selectattr('value.action', 'equalto', 'repair_backend')
+            | map(attribute='key')
+            | list
+          }}
+        actionable_cert_types: >-
+          {{
+            cert_actions | dict2items
+            | rejectattr('value.action', 'equalto', 'skip')
+            | map(attribute='key')
+            | list
+          }}
+        _existing_registry_cert_types: >-
+          {{
+            (
+              cert_registry[qmgr_name].certs.keys() | list
+            )
+            if (
+              cert_registry is defined
+              and qmgr_name in cert_registry
+              and cert_registry[qmgr_name].certs is defined
+            )
+            else []
+          }}
+
+    # Purpose: Decide whether certificate inventory must be updated after backend work.
+    - name: "Cert target - Determine registry update requirement"
+      ansible.builtin.set_fact:
+        cert_registry_update_required: >-
+          {{
+            cert_registry_enabled | default(false) | bool
+            and (
+              actionable_cert_types | length > 0
+              or cert_registry is not defined
+              or qmgr_name not in (cert_registry | default({}))
+              or active_cert_types | difference(_existing_registry_cert_types) | length > 0
+            )
+          }}
+
+    # Purpose: Print which certificate types will be requested, repaired, skipped, or recorded.
+    - name: "Cert target - Action plan"
+      ansible.builtin.debug:
+        msg:
+          - "Queue Manager : {{ qmgr_name | upper }}"
+          - "Issue/Renew   : {{ venafi_actionable_cert_types | join(', ') | default('none', true) }}"
+          - "Backend Repair: {{ backend_repair_cert_types | join(', ') | default('none', true) }}"
+          - "Skipped       : {{ active_cert_types | difference(actionable_cert_types) | join(', ') | default('none', true) }}"
+          - >-
+            Registry      :
+            {{ 'update required' if cert_registry_update_required | bool
+               else ('disabled' if not (cert_registry_enabled | default(false) | bool)
+               else 'already current') }}
+
+    # Purpose: Stop early if Venafi connection settings are incomplete.
+    - name: "Cert target - Validate certificate provider settings for certificate requests"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/validate_venafi_config.yaml"
+      when:
+        - venafi_actionable_cert_types | length > 0
+        - venafi_token | default('', true) | length == 0
+
+    # Purpose: Get a Venafi token before requesting or checking certificates.
+    - name: "Cert target - Authenticate to certificate provider for certificate requests"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/venafi_auth.yaml"
+      when:
+        - venafi_actionable_cert_types | length > 0
+        - venafi_token | default('', true) | length == 0
+
+    # Purpose: Generate the CSR used to request the certificate from Venafi.
+    - name: "Cert target - Generate CSRs"
+      ansible.builtin.include_tasks: generate_csr.yaml
+      loop: "{{ venafi_actionable_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+      when: venafi_actionable_cert_types | length > 0
+
+    # Purpose: Submit and deliver certificates.
+    - name: "Cert target - Submit and deliver certificates"
+      ansible.builtin.include_tasks: submit_and_store.yaml
+      loop: "{{ venafi_actionable_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+      when: venafi_actionable_cert_types | length > 0
+
+    # Purpose: Repair backend delivery from existing certificates.
+    - name: "Cert target - Repair backend delivery from existing certificates"
+      ansible.builtin.include_tasks: repair_backend.yaml
+      loop: "{{ backend_repair_cert_types }}"
+      loop_control:
+        loop_var: cert_type
+        label: "{{ cert_type }}"
+      when: backend_repair_cert_types | length > 0
+
+    # Purpose: Create or update the OpenShift Secret with approved certificate data.
+    - name: "Cert target - Seed client/signer trust Secret"
+      ansible.builtin.include_tasks: apply_client_trust_seed.yaml
+      when: _client_trust_default_ca_pem | default('', true) | length > 0
+
+    # Purpose: Write certificate inventory metadata on the registry branch.
+    - name: "Cert target - Update certificate registry"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/update_registry.yaml"
+      vars:
+        registry_update:
+          qmgr_name: "{{ qmgr_name }}"
+          data:
+            app_sys_id: "{{ app_sys_id }}"
+            app_prefix: "{{ app_prefix }}"
+            environment: "{{ env_upper }}"
+            qmgr_name: "{{ qmgr_name }}"
+            namespace: "{{ namespace }}"
+            namespace_source: "{{ namespace_source | default('derived') }}"
+            sequence_number: "{{ sequence_number }}"
+            instance_type: "{{ instance_type }}"
+            cert_profile: "{{ active_cert_types }}"
+            delivery_backend: "{{ cert_delivery_backend_effective }}"
+            target_regions: "{{ target_regions }}"
+            openshift_targets: "{{ _registry_openshift_targets }}"
+            vault_base_path: "{{ vault_cert_base_path }}"
+            vault_mount: "{{ vault_cert_mount_point }}"
+            vault_namespace: "{{ vault_namespace }}"
+            client_trust_secret: "{{ qmgr_name }}-{{ mq_client_trust_secret_suffix | default('client-certs') }}"
+            client_trust_vault_path: >-
+              {{
+                vault_client_trust_shared_path
+                | default(mq_client_trust_vault_shared_path | default(app_prefix ~ '/ibm-mq/shared'))
+              }}
+            last_updated: "{{ now(utc=true) | string }}"
+            certs: "{{ registry_cert_data }}"
+        registry_commit_msg: >-
+          cert {{ cert_force_renew | default(false) | bool | ternary('renew', 'onboard') }}:
+          {{ qmgr_name | upper }} backend={{ cert_delivery_backend_effective }}
+          actioned={{ actionable_cert_types | length }}
+      when: cert_registry_update_required | bool
+
+    # Purpose: Prepare the certificate onboard result shown to the operator.
+    - name: "Cert target - Capture final report data"
+      ansible.builtin.set_fact:
+        nativeha_report_cert_results: >-
+          {{
+            nativeha_report_cert_results | default([])
+            + [
+              {
+                'qmgr_name': qmgr_name,
+                'environment': env_upper,
+                'namespace': namespace,
+                'backend': cert_delivery_backend_effective,
+                'cert_types': active_cert_types,
+                'actioned': actionable_cert_types,
+                'certs': registry_cert_data,
+                'actions': cert_actions,
+                'client_trust_seed': cert_client_trust_seed_result | default({}),
+                'registry_enabled': cert_registry_enabled | default(false) | bool,
+                'registry_updated': (
+                  cert_registry_update_required | bool
+                  and _registry_git_diff is defined
+                  and (_registry_git_diff.rc | default(0) | int) != 0
+                )
+              }
+            ]
+          }}
+
+    # Purpose: Record the workflow result for final reporting.
+    - name: "Cert target - Complete"
+      ansible.builtin.debug:
+        msg:
+          - "Queue Manager : {{ qmgr_name | upper }}"
+          - "Environment   : {{ env_upper }}"
+          - "Backend       : {{ cert_delivery_backend_effective }}"
+          - "Cert Types    : {{ active_cert_types | join(', ') }}"
+          - "Actioned      : {{ actionable_cert_types | join(', ') | default('none', true) }}"
+          - >-
+            Client Trust  :
+            {{ (cert_client_trust_seed_result.secret_name ~ ' item=' ~ cert_client_trust_seed_result.item)
+               if cert_client_trust_seed_result is defined else 'not changed' }}
+          - >-
+            Registry      :
+            {% if cert_registry_enabled | default(false) | bool and _registry_git_diff is defined
+                  and (_registry_git_diff.rc | default(0) | int) != 0 %}
+            Updated
+            {% elif not (cert_registry_enabled | default(false) | bool) %}
+            Disabled
+            {% else %}
+            Already current
+            {% endif %}
+
+  rescue:
+    # Purpose: Save the real failure detail before the final report is built.
+    - name: "Cert target - Capture failure cause"
+      ansible.builtin.set_fact:
+        _cert_target_failure_detail: >-
+          {{
+            ansible_failed_result.msg
+            | default(
+                ansible_failed_result.stderr
+                | default('The certificate lifecycle failed before a detailed cause was returned.')
+              )
+            | string
+            | trim
+          }}
+
+    # Purpose: Combine the failed step, task name, and message for the final report.
+    - name: "Cert target - Failure context"
+      ansible.builtin.debug:
+        msg: |-
+          Certificate lifecycle failed for {{ qmgr_name | upper }} in {{ env_upper }}.
+
+          {{ _cert_target_failure_detail }}
+
+          Temporary key material will be cleaned up.
+
+    # Purpose: End the AAP job as failed after reporting the original problem.
+    - name: "Cert target - Re-raise failure"
+      ansible.builtin.fail:
+        msg: |-
+          Certificate lifecycle failed for {{ qmgr_name | upper }} in {{ env_upper }}.
+
+          {{ _cert_target_failure_detail }}
+
+  always:
+    # Purpose: Remove temporary files created during this run.
+    - name: "Cert target - Wipe temp directory"
+      ansible.builtin.file:
+        path: "{{ cert_tmp_dir.path }}"
+        state: absent
+      when: cert_tmp_dir is defined and cert_tmp_dir.path is defined
+
+    # Purpose: Revoke the certificate from the provider when configured.
+    - name: "Cert target - Revoke certificate provider token"
+      ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/venafi_revoke_token.yaml"
+      when: venafi_token | default('', true) | length > 0

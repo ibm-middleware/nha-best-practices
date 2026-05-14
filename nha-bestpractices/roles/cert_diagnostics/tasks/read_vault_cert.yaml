@@ -1,0 +1,73 @@
+---
+# Purpose: Choose vault path for {{ cert_type }} from inputs and defaults.
+- name: "Diagnostics - Resolve Vault path for {{ cert_type }}"
+  ansible.builtin.set_fact:
+    _vault_cert_path: "{{ vault_cert_base_path }}/{{ cert_type_vault_subpath[cert_type] }}"
+
+# Purpose: Read existing Vault certificate data for comparison or diagnostics.
+- name: "Diagnostics - Read Vault KV for {{ cert_type }}"
+  ansible.builtin.include_tasks: "{{ role_path }}/../cert_common/tasks/vault_read.yaml"
+
+# Purpose: Read certificate details needed for lifecycle decisions and reporting.
+- name: "Diagnostics - Vault read result for {{ cert_type }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ cert_type }} at {{ vault_cert_mount_point }}/{{ _vault_cert_path }}:
+      {{ 'found' if (
+           not (_vault_read.failed | default(false))
+           and (_vault_read.data is defined)
+           and (_vault_read.data.data is defined)
+           and (_vault_read.data.data['tls.crt'] is defined)
+         ) else 'missing or unreadable' }}
+
+# Purpose: Store Vault certificate read diagnostics for the final report.
+- name: "Diagnostics - Record Vault read result for {{ cert_type }}"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'mode_label': 'Vault Certificate Read',
+            'qmgr_name': qmgr_name,
+            'namespace': namespace,
+            'target': qmgr_name | upper,
+            'check': 'Vault cert read: ' ~ cert_type,
+            'status': (
+              'passed'
+              if (
+                not (_vault_read.failed | default(false))
+                and (_vault_read.data is defined)
+                and (_vault_read.data.data is defined)
+                and (_vault_read.data.data['tls.crt'] is defined)
+              )
+              else 'attention'
+            ),
+            'detail': (
+              'Path: ' ~ vault_cert_mount_point ~ '/' ~ _vault_cert_path
+              ~ ' | ' ~ (
+                (
+                  'tls.crt: present'
+                  ~ (
+                    ', tls.key: present'
+                    if (_vault_read.data is defined and _vault_read.data.data is defined and _vault_read.data.data['tls.key'] is defined)
+                    else ', tls.key: MISSING'
+                  )
+                )
+                if (
+                  not (_vault_read.failed | default(false))
+                  and (_vault_read.data is defined)
+                  and (_vault_read.data.data is defined)
+                  and (_vault_read.data.data['tls.crt'] is defined)
+                )
+                else (
+                  'NOT FOUND — path does not exist or Vault token lacks read access'
+                  if (_vault_read.failed | default(false))
+                  else 'data structure empty or missing tls.crt key'
+                )
+              )
+            )
+          }
+        ]
+      }}

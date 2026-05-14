@@ -1,0 +1,44 @@
+---
+# Purpose: Update the shared MQ image patch for selected queue managers.
+- name: "NativeHA MQ Upgrade - {{ qmgr_name | default('UNDEFINED') | upper }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  tasks:
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    - name: "Run MQ image upgrade workflow"
+      block:
+        - name: "MQ image upgrade - Execute"
+          ansible.builtin.include_role:
+            name: qmgr_image_upgrade
+
+        - name: "MQ image upgrade - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        - name: "MQ image upgrade - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        - name: "MQ image upgrade - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "MQ Image Upgrade"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Update the shared MQ image patch for selected queue managers and
+              publish the GitOps change.
+
+        - name: "MQ image upgrade - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('MQ image upgrade failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

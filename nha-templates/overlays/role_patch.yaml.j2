@@ -1,0 +1,25 @@
+{#
+What it is:
+  JSON 6902 patch for the CRR local role.
+Purpose:
+  Keeps the Day-2 role-switch write set tiny: only the local role value should
+  change in this file. Regional identity and remote addresses live in the
+  immutable topology patch generated during onboarding.
+Variables coming from:
+  qmgr onboarding and role switch facts: current_region, crr_role.
+  global_vars: regions.
+Produces:
+  overlays/<region>/<region_label>-patch-role.yaml.
+#}
+---
+# {{ regions[current_region].region_label }}-patch-role.yaml
+# Mutable Day-2 role patch. Do not add regional topology here.
+#
+# Managed by:
+#   - NativeHA_Qmgr_Onboard (initial generation)
+#   - qmgr_role_switch       (Day-2 role swap - edits role value only)
+
+# NativeHA Group - local role
+- op: replace
+  path: /spec/queueManager/availability/nativeHAGroups/local/role
+  value: {{ crr_role | trim }}

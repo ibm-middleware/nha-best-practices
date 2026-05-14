@@ -1,0 +1,102 @@
+---
+# Retrieve the signer chain from Venafi TPP for an existing certificate object.
+# The chain is requested root-first and without the private key.
+
+# Purpose: Download the Venafi signer chain for {{ cert_type }} diagnostics.
+- name: "Diagnostics - Retrieve Venafi chain {{ cert_type }}"
+  ansible.builtin.uri:
+    url: "{{ venafi_url }}{{ venafi_cert_retrieve }}"
+    method: POST
+    headers:
+      accept: "application/json"
+      Authorization: "Bearer {{ venafi_token }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      CertificateDN: "{{ venafi_policy_dn }}\\{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}"
+      Format: "Base64"
+      IncludeChain: true
+      IncludePrivateKey: false
+      RootFirstOrder: true
+    validate_certs: "{{ venafi_validate_certs }}"
+    status_code: [200, 202, 400, 404]
+  register: _venafi_chain
+  failed_when: false
+  no_log: true
+
+# Purpose: Check whether the generated queue manager path already exists.
+- name: "Diagnostics - Ensure diagnostic output directory exists"
+  ansible.builtin.file:
+    path: "{{ diagnostic_output_dir }}"
+    state: directory
+    mode: "0700"
+  when:
+    - diagnostic_output_dir is defined
+    - diagnostic_output_dir | length > 0
+    - _venafi_chain.status | default(0) == 200
+    - _venafi_chain.json is defined
+    - _venafi_chain.json.CertificateData is defined
+
+# Purpose: Save the downloaded Venafi chain to the diagnostics file.
+- name: "Diagnostics - Write Venafi chain to file"
+  ansible.builtin.copy:
+    content: "{{ _venafi_chain.json.CertificateData | b64decode }}"
+    dest: "{{ diagnostic_output_dir }}/{{ qmgr_name }}_{{ cert_type }}_chain_root_first.pem"
+    mode: "0600"
+  when:
+    - diagnostic_output_dir is defined
+    - diagnostic_output_dir | length > 0
+    - _venafi_chain.status | default(0) == 200
+    - _venafi_chain.json is defined
+    - _venafi_chain.json.CertificateData is defined
+
+# Purpose: Choose venafi chain output path {{ cert_type }} from inputs and defaults.
+- name: "Diagnostics - Resolve Venafi chain output path {{ cert_type }}"
+  ansible.builtin.set_fact:
+    _venafi_chain_output_path: >-
+      {{
+        diagnostic_output_dir ~ '/' ~ qmgr_name ~ '_' ~ cert_type ~ '_chain_root_first.pem'
+        if (
+          diagnostic_output_dir is defined
+          and diagnostic_output_dir | length > 0
+          and _venafi_chain.json is defined
+          and _venafi_chain.json.CertificateData is defined
+        )
+        else 'not written'
+      }}
+
+# Purpose: Record the downloaded signer chain path for {{ cert_type }} diagnostics.
+- name: "Diagnostics - Venafi chain result {{ cert_type }}"
+  ansible.builtin.debug:
+    msg:
+      - "Cert Type : {{ cert_type }}"
+      - "DN        : {{ venafi_policy_dn }}\\{{ qmgr_name }}_{{ cert_type_csr_suffix[cert_type] }}"
+      - "HTTP      : {{ _venafi_chain.status | default('unknown') }}"
+      - "Chain     : {{ 'retrieved' if (_venafi_chain.json is defined and _venafi_chain.json.CertificateData is defined) else 'not available' }}"
+      - "Output    : {{ _venafi_chain_output_path }}"
+
+# Purpose: Store Venafi chain diagnostics for the final report.
+- name: "Diagnostics - Record Venafi chain result {{ cert_type }}"
+  ansible.builtin.set_fact:
+    nativeha_report_diagnostic_results: >-
+      {{
+        nativeha_report_diagnostic_results | default([])
+        + [
+          {
+            'mode': diagnostic_mode_effective,
+            'qmgr_name': qmgr_name,
+            'namespace': namespace,
+            'target': qmgr_name | upper,
+            'check': 'Venafi signer chain: ' ~ cert_type,
+            'status': (
+              'passed'
+              if (_venafi_chain.json is defined and _venafi_chain.json.CertificateData is defined)
+              else 'attention'
+            ),
+            'detail': (
+              'HTTP ' ~ (_venafi_chain.status | default('unknown') | string)
+              ~ '; output=' ~ _venafi_chain_output_path
+            )
+          }
+        ]
+      }}

@@ -1,0 +1,44 @@
+---
+# Purpose: Recompute queue manager sizing and update the shared sizing patch.
+- name: "NativeHA Queue Manager Sizing Update - {{ qmgr_name | default('UNDEFINED') | upper }}"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../../../nativeha_templates/global_vars/nativeha_qmgr_control_vars.yaml
+
+  tasks:
+    - name: "Initialize NativeHA run context"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/init_run_context.yaml"
+
+    - name: "Run queue manager sizing update workflow"
+      block:
+        - name: "Queue manager sizing update - Execute"
+          ansible.builtin.include_role:
+            name: qmgr_sizing_update
+
+        - name: "Queue manager sizing update - Mark success"
+          ansible.builtin.set_fact:
+            nativeha_playbook_status: "success"
+
+      rescue:
+        - name: "Queue manager sizing update - Capture failure"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../common/capture_failure.yaml"
+
+      always:
+        - name: "Queue manager sizing update - Send final report"
+          ansible.builtin.include_role:
+            name: final_report
+          vars:
+            final_report_title: "Queue Manager Sizing Update"
+            final_report_status: "{{ nativeha_playbook_status | default('failed') }}"
+            final_report_error: "{{ nativeha_playbook_error | default('') }}"
+            final_report_summary: >-
+              Recompute sizing for selected queue managers and publish only the
+              shared sizing patch changes.
+
+        - name: "Queue manager sizing update - Re-raise failure"
+          ansible.builtin.fail:
+            msg: "{{ nativeha_playbook_error | default('Queue manager sizing update failed.') }}"
+          when: nativeha_playbook_status | default('failed') != 'success'

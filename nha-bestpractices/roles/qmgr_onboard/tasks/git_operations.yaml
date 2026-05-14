@@ -1,0 +1,22 @@
+---
+# git_operations.yaml - Shared Git clone and configure tasks
+# Included by the onboarding workflow to keep git setup separate from
+# queue manager identity, sizing, and manifest generation logic.
+#
+# Delegates to the shared gitops_publish role.
+#
+# Required variables (must be set before including):
+#   git_repo_url    - Target repo SSH URL, from env_repo_map[env_upper]
+#   target_branch   - Base branch to clone, from env_branch_map[env_upper]
+#   git_work_dir    - Unique local checkout path created by workflow.yaml
+#   git_user_name   - Git commit author name from global vars
+#   git_user_email  - Git commit author email from global vars
+#
+# Outputs:
+#   Working directory ready at {{ git_work_dir }} on the base branch
+
+# Purpose: Clone the target repository and set the automation Git identity.
+- name: "Git - Clone and configure target repo"
+  ansible.builtin.include_role:
+    name: gitops_publish
+    tasks_from: git_clone_and_configure

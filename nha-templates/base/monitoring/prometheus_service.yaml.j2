@@ -1,0 +1,33 @@
+{#
+What it is:
+  Service for the MQ Prometheus exporter.
+Purpose:
+  Exposes the exporter metrics port inside the namespace for scraping.
+Variables coming from:
+  qmgr onboarding facts: qmgr_name, namespace.
+  global_vars: prometheus_metrics_port.
+Produces:
+  base/monitoring/prometheus_service.yaml.
+#}
+---
+# Service for MQ Prometheus exporter
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ qmgr_name }}-prometheus-exporter
+  namespace: {{ namespace }}
+  annotations:
+    prometheus.io/scrape: 'true'
+    prometheus.io/port: '{{ prometheus_metrics_port }}'
+  labels:
+    app.kubernetes.io/name: {{ qmgr_name }}-prometheus-exporter
+    app.kubernetes.io/component: monitoring
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: {{ prometheus_metrics_port }}
+      targetPort: {{ prometheus_metrics_port }}
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: {{ qmgr_name }}-prometheus-exporter

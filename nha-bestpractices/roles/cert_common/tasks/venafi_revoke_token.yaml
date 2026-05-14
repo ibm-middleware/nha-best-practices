@@ -1,0 +1,24 @@
+---
+# Purpose: Revoke the Venafi bearer token to limit its usable lifetime.
+- name: "Venafi - Revoke bearer token"
+  ansible.builtin.uri:
+    url: "{{ venafi_url }}{{ venafi_token_revoke }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ venafi_token }}"
+    validate_certs: "{{ venafi_validate_certs }}"
+    status_code: [200, 401]
+    timeout: "{{ nativeha_api_timeout | default(45) | int }}"
+    use_netrc: false
+    unredirected_headers:
+      - Authorization
+  when: venafi_token | default('', true) | length > 0
+  failed_when: false
+  no_log: true
+
+# Purpose: Clear the Venafi token after provider calls finish.
+- name: "Venafi - Clear bearer token fact"
+  ansible.builtin.set_fact:
+    venafi_token: ""
+  when: venafi_token is defined
+  no_log: true
